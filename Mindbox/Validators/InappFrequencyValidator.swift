@@ -1,0 +1,104 @@
+//
+//  InappFrequencyValidator.swift
+//  Mindbox
+//
+//  Created by vailence on 11.04.2024.
+//  Copyright © 2024 Mindbox. All rights reserved.
+//
+
+import Foundation
+import MindboxLogger
+
+class InappFrequencyValidator {
+    let persistenceStorage: PersistenceStorage
+
+    init(persistenceStorage: PersistenceStorage) {
+        self.persistenceStorage = persistenceStorage
+    }
+
+    func isValid(frequency: InappFrequency?, id: String) -> Bool {
+        isValid(frequency: frequency,
+                id: id,
+                shownInSession: SessionTemporaryStorage.shared.sessionShownInApps,
+                shownDatesByInApp: persistenceStorage.shownDatesByInApp)
+    }
+
+    func isValid(frequency: InappFrequency?, id: String, shownInSession: [String], shownDatesByInApp: [String: [Date]]?) -> Bool {
+        guard let frequency = frequency else {
+            return false
+        }
+
+        switch frequency {
+            case .periodic(let periodicFrequency):
+                return PeriodicFrequencyValidator().isValid(item: periodicFrequency, id: id, shownDatesByInApp: shownDatesByInApp)
+            case .once(let onceFrequency):
+                return OnceFrequencyValidator().isValid(item: onceFrequency, id: id, shownInSession: shownInSession, shownDatesByInApp: shownDatesByInApp)
+            case .unlimited:
+                Logger.common(message: "[Inapp frequency] Current frequency is [unlimited]. Valid = true. Inapp ID: \(id)",
+                              level: .debug, category: .inAppMessages)
+                return true
+            case .unknown:
+                return false
+        }
+    }
+}
+
+class OnceFrequencyValidator {
+
+    func isValid(item: OnceFrequency, id: String, shownInSession: [String], shownDatesByInApp: [String: [Date]]?) -> Bool {
+        var result = false
+        switch item.kind {
+            case .lifetime:
+                result = shownDatesByInApp?[id] == nil
+            case .session:
+                if shownInSession.contains(id) {
+                    Logger.common(message: "[Inapp frequency] Inapp ID \(id) is already shown in this session. Skip this in-app.",
+                                  level: .debug, category: .inAppMessages)
+                    result = false
+                } else {
+                    result = true
+                }
+        }
+
+        Logger.common(message: "[Inapp frequency] Current frequency is [once] and kind is [\(item.kind.rawValue)]. Valid = \(result). Inapp ID: \(id)",
+                      level: .debug, category: .inAppMessages)
+        return result
+    }
+}
+
+class PeriodicFrequencyValidator {
+
+    func isValid(item: PeriodicFrequency, id: String, shownDatesByInApp: [String: [Date]]?) -> Bool {
+        let currentDate = Date()
+        guard let inappsDict = shownDatesByInApp else {
+            Logger.common(message: "shownDatesByInApp not exists. Inapp ID \(id) is not valid.", level: .error, category: .inAppMessages)
+            return false
+        }
+
+        guard let shownDates = inappsDict[id], !shownDates.isEmpty else {
+            Logger.common(message: """
+            [Inapp frequency] Current frequency is [periodic] and unit is [\(item.unit.rawValue)].
+            Inapp ID \(id) is never shown before.
+            Keeping in-app.
+            """, level: .info, category: .inAppMessages)
+            return true
+        }
+
+        let calendar = Calendar.current
+        let component = item.unit.calendarComponent
+        if let lastShownDate = shownDates.last,
+           let shownDatePlusFrequency = calendar.date(byAdding: component, value: item.value, to: lastShownDate) {
+            let isValid = currentDate > shownDatePlusFrequency
+            Logger.common(message: """
+            [Inapp frequency] Current frequency is [periodic] and unit is [\(item.unit.rawValue)] value is (\(item.value)).
+            Last shown date plus frequency: \(shownDatePlusFrequency.asDateTimeWithSeconds).
+            Current date: \(currentDate.asDateTimeWithSeconds).
+            Inapp ID \(id) valid = \(isValid)
+            """, level: .debug, category: .inAppMessages)
+            return isValid
+        } else {
+            Logger.common(message: "Failed to calculate the next valid show date for Inapp ID \(id).", level: .error, category: .inAppMessages)
+            return false
+        }
+    }
+}

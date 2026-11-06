@@ -1,0 +1,18 @@
+//
+//  InAppsCheckRequest.swift
+//  Mindbox
+//
+//  Created by Maksim Kazakov on 06.09.2022.
+//  Copyright © 2022 Mikhail Barilov. All rights reserved.
+//
+
+import Foundation
+
+struct InAppsCheckRequest: Equatable {
+    let triggerEvent: InAppMessageTriggerEvent
+    var possibleInApps: [InAppInfo]
+
+    struct InAppInfo: Equatable {
+        let inAppId: String
+    }
+}

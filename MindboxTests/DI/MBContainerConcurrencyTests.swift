@@ -1,0 +1,46 @@
+//
+//  MBContainerConcurrencyTests.swift
+//  MindboxTests
+//
+//  Created by Sergei Semko on 08.07.2026.
+//  Copyright © 2026 Mindbox. All rights reserved.
+//
+
+import Testing
+import Foundation
+@testable import Mindbox
+
+@Suite("MBContainer thread safety", .tags(.dependencyInjection))
+struct MBContainerConcurrencyTests {
+
+    private final class Service {}
+
+    @Test
+    func concurrentResolveMintsOneInstance() {
+        let container = MBContainer()
+        let counterLock = NSLock()
+        var factoryCalls = 0
+
+        let factoryDelayThatMakesAMissingLockRace: TimeInterval = 0.02
+        container.register(Service.self, scope: .container) {
+            Thread.sleep(forTimeInterval: factoryDelayThatMakesAMissingLockRace)
+            counterLock.lock()
+            factoryCalls += 1
+            counterLock.unlock()
+            return Service()
+        }
+
+        let resultsLock = NSLock()
+        var identifiers = Set<ObjectIdentifier>()
+        DispatchQueue.concurrentPerform(iterations: 32) { _ in
+            if let service = container.resolve(Service.self) {
+                resultsLock.lock()
+                identifiers.insert(ObjectIdentifier(service))
+                resultsLock.unlock()
+            }
+        }
+
+        #expect(factoryCalls == 1)
+        #expect(identifiers.count == 1)
+    }
+}

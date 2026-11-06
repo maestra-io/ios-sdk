@@ -1,0 +1,393 @@
+//
+//  MBPersistenceStorage.swift
+//  Mindbox
+//
+//  Created by Maksim Kazachkov on 02.02.2021.
+//  Copyright © 2021 Mindbox. All rights reserved.
+//
+
+import Foundation
+import MindboxLogger
+
+class MBPersistenceStorage: PersistenceStorage {
+
+    var onDidChange: (() -> Void)?
+
+    // MARK: - Dependency
+    static var defaults: UserDefaults = .standard
+
+    // MARK: - Property
+    var isInstalled: Bool {
+        installationDateString != nil
+    }
+
+    var installationDate: Date? {
+        get {
+            if let dateString = installationDateString {
+                return dateString.toDate(withFormat: .utc)
+            } else {
+                return nil
+            }
+        }
+        set {
+            if let date = newValue {
+                installationDateString = date.toString(withFormat: .utc)
+            } else {
+                installationDateString = nil
+            }
+        }
+    }
+
+    var firstInitializationDateTime: Date? {
+        get {
+            if let dateString = firstInitializationDateTimeString {
+                return dateString.toDate(withFormat: .utc)
+            } else {
+                return nil
+            }
+        }
+        set {
+            if let date = newValue {
+                firstInitializationDateTimeString = date.toString(withFormat: .utc)
+            } else {
+                firstInitializationDateTimeString = nil
+            }
+        }
+    }
+
+    var apnsTokenSaveDate: Date? {
+        get {
+            if let dateString = apnsTokenSaveDateString {
+                return dateString.toDate(withFormat: .utc)
+            } else {
+                return nil
+            }
+        }
+        set {
+            if let date = newValue {
+                apnsTokenSaveDateString = date.toString(withFormat: .utc)
+            } else {
+                apnsTokenSaveDateString = nil
+            }
+        }
+    }
+    
+    var lastInfoUpdateDate: Date? {
+        get {
+            if let dateString = lastInfoUpdateDateString {
+                return dateString.toDate(withFormat: .utc)
+            } else {
+                return nil
+            }
+        }
+        
+        set {
+            if let date = newValue {
+                lastInfoUpdateDateString = date.toString(withFormat: .utc)
+            } else {
+                lastInfoUpdateDateString = nil
+            }
+        }
+    }
+
+    var deprecatedEventsRemoveDate: Date? {
+        get {
+            if let dateString = deprecatedEventsRemoveDateString {
+                return dateString.toDate(withFormat: .utc)
+            } else {
+                return nil
+            }
+        }
+        set {
+            if let date = newValue {
+                deprecatedEventsRemoveDateString = date.toString(withFormat: .utc)
+            } else {
+                deprecatedEventsRemoveDateString = nil
+            }
+        }
+    }
+
+    var configuration: MBConfiguration? {
+        get {
+            guard let data = configurationData else {
+                return nil
+            }
+            return try? JSONDecoder().decode(MBConfiguration.self, from: data)
+        }
+        set {
+            if let data = newValue {
+                configurationData = try? JSONEncoder().encode(data)
+            } else {
+                configurationData = nil
+            }
+        }
+    }
+
+    var configDownloadDate: Date? {
+        get {
+            if let dateString = configDownloadDateString {
+                return dateString.toDate(withFormat: .utc)
+            } else {
+                return nil
+            }
+        }
+        set {
+            if let date = newValue {
+                configDownloadDateString = date.toString(withFormat: .utc)
+            } else {
+                configDownloadDateString = nil
+            }
+        }
+    }
+
+    init(defaults: UserDefaults) {
+        MBPersistenceStorage.defaults = defaults
+    }
+
+    @UserDefaultsWrapper(key: .deviceUUID, defaultValue: nil)
+    var deviceUUID: String? {
+        didSet {
+            configuration?.previousDeviceUUID = deviceUUID
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .installationId, defaultValue: nil)
+    var installationId: String? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .apnsToken, defaultValue: nil)
+    var apnsToken: String? {
+        didSet {
+            apnsTokenSaveDate = Date()
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .shownDatesByInApp, defaultValue: [:])
+    var shownDatesByInApp: [String: [Date]]?
+
+    @UserDefaultsWrapper(key: .lastInappStateChangeDate, defaultValue: nil)
+    var lastInappStateChangeDate: Date?
+
+    @UserDefaultsWrapper(key: .handledlogRequestIds, defaultValue: nil)
+    var handledlogRequestIds: [String]?
+
+    @UserDefaultsWrapper(key: .imageLoadingMaxTimeInSeconds, defaultValue: nil)
+    var imageLoadingMaxTimeInSeconds: Double?
+
+    @UserDefaultsWrapper(key: .apnsTokenSaveDate, defaultValue: nil)
+    private var apnsTokenSaveDateString: String? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .deprecatedEventsRemoveDate, defaultValue: nil)
+    private var deprecatedEventsRemoveDateString: String? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .configurationData, defaultValue: nil)
+    private var configurationData: Data? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .isNotificationsEnabled, defaultValue: nil)
+    var isNotificationsEnabled: Bool? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .installationData, defaultValue: nil)
+    private var installationDateString: String? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .firstInitializationDateTime, defaultValue: nil)
+    private var firstInitializationDateTimeString: String? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .needUpdateInfoOnce, defaultValue: nil)
+    var needUpdateInfoOnce: Bool? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .userVisitCount, defaultValue: 0)
+    var userVisitCount: Int? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    @UserDefaultsWrapper(key: .versionCodeForMigration, defaultValue: 0)
+    var versionCodeForMigration: Int?
+
+    @UserDefaultsWrapper(key: .configDownloadDate, defaultValue: nil)
+    private var configDownloadDateString: String? {
+        didSet {
+            onDidChange?()
+        }
+    }
+    
+    @UserDefaultsWrapper(key: .lastInfoUpdateTime, defaultValue: nil)
+    var lastInfoUpdateDateString: String? {
+        didSet {
+            onDidChange?()
+        }
+    }
+    
+    @UserDefaultsWrapper(key: .applicationInfoUpdateVersion, defaultValue: nil)
+    var applicationInfoUpdateVersion: Int?
+    
+    @UserDefaultsWrapper(key: .applicationInstanceId, defaultValue: nil)
+    var applicationInstanceId: String?
+
+    @UserDefaultsWrapper(key: .webViewLocalStateVersion, defaultValue: nil)
+    var webViewLocalStateVersion: Int?
+
+    @UserDefaultsWrapper(key: .webViewLearnedHosts, defaultValue: nil)
+    var webViewLearnedHosts: [String: [String]]?
+
+    @UserDefaultsWrapper(key: .embeddedBlockPlaceRecords, defaultValue: nil)
+    var embeddedBlockPlaceRecords: [String: Data]?
+
+    @UserDefaultsWrapper(key: .operationsDomainFromConfig, defaultValue: nil)
+    var operationsDomainFromConfig: String? {
+        didSet {
+            onDidChange?()
+        }
+    }
+
+    // MARK: - Deprecated Properties
+    
+    @UserDefaultsWrapper(key: .shownInAppsIds, defaultValue: nil)
+    var shownInAppsIds: [String]?
+
+    @UserDefaultsWrapper(key: .shownInAppsDictionary, defaultValue: [:])
+    var shownInappsDictionary: [String: Date]?
+}
+
+extension MBPersistenceStorage {
+
+    @propertyWrapper
+    struct UserDefaultsWrapper<T> {
+
+        enum Key: String {
+            case installationId = "MBPersistenceStorage-installationId"
+            case deviceUUID = "MBPersistenceStorage-deviceUUID"
+            case apnsToken = "MBPersistenceStorage-apnsToken"
+            case apnsTokenSaveDate = "MBPersistenceStorage-apnsTokenSaveDate"
+            case lastInfoUpdateTime = "MBPersistenceStorage-lastInfoUpdateTime"
+            case deprecatedEventsRemoveDate = "MBPersistenceStorage-deprecatedEventsRemoveDate"
+            case configurationData = "MBPersistenceStorage-configurationData"
+            case isNotificationsEnabled = "MBPersistenceStorage-isNotificationsEnabled"
+            case installationData = "MBPersistenceStorage-installationData"
+            case firstInitializationDateTime = "MBPersistenceStorage-firstInitializationDateTime"
+            case shownDatesByInApp = "MBPersistenceStorage-shownDatesByInApp"
+            case lastInappStateChangeDate = "MBPersistenceStorage-lastInappStateChangeDate"
+            case handledlogRequestIds = "MBPersistenceStorage-handledlogRequestIds"
+            case imageLoadingMaxTimeInSeconds = "MBPersistenceStorage-imageLoadingMaxTimeInSeconds"
+            case needUpdateInfoOnce = "MBPersistenceStorage-needUpdateInfoOnce"
+            case userVisitCount = "MBPersistenceStorage-userVisitCount"
+            case configDownloadDate = "MBPersistenceStorage-configDownloadDate"
+            case versionCodeForMigration = "MBPersistenceStorage-versionCodeForMigration"
+            case applicationInfoUpdateVersion = "MBPersistenceStorage-applicationInfoUpdatedVersion"
+            case applicationInstanceId = "MBPersistenceStorage-applicationInstanceId"
+            case webViewLocalStateVersion = "MBPersistenceStorage-webViewLocalStateVersion"
+            case webViewLearnedHosts = "MBPersistenceStorage-webViewLearnedHosts"
+            case embeddedBlockPlaceRecords = "MBPersistenceStorage-embeddedBlockPlaceRecords"
+            case operationsDomainFromConfig = "MBPersistenceStorage-operationsDomainFromConfig"
+
+            // MARK: - Deprecated Keys
+            
+            case shownInAppsIds = "MBPersistenceStorage-shownInAppsIds"
+            case shownInAppsDictionary = "MBPersistenceStorage-shownInAppsDictionary"
+        }
+
+        private let key: Key
+        private let defaultValue: T?
+
+        init(key: Key, defaultValue: T?) {
+            self.key = key
+            self.defaultValue = defaultValue
+        }
+
+        var wrappedValue: T? {
+            get {
+                let isExists = defaults.isValueExists(forKey: key.rawValue)
+                let value = MBPersistenceStorage.defaults.value(forKey: key.rawValue) as? T ?? defaultValue
+                return isExists ? value : defaultValue
+            }
+            set {
+                MBPersistenceStorage.defaults.setValue(newValue, forKey: key.rawValue)
+                MBPersistenceStorage.defaults.synchronize()
+            }
+        }
+    }
+}
+
+fileprivate extension UserDefaults {
+
+    func isValueExists(forKey key: String) -> Bool {
+        return object(forKey: key) != nil
+    }
+}
+
+// MARK: - Install-state probing across stores
+
+extension MBPersistenceStorage {
+
+    static var installationDataKey: String {
+        UserDefaultsWrapper<String>.Key.installationData.rawValue
+    }
+
+    static func isInstalled(in defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: installationDataKey) != nil
+    }
+}
+
+struct AppGroupStorageTransitionReporter {
+
+    private let localDefaults: UserDefaults
+    private let sharedDefaults: UserDefaults?
+
+    init(activeDefaults: UserDefaults = MBPersistenceStorage.defaults,
+         localDefaults: UserDefaults = .standard) {
+        self.localDefaults = localDefaults
+        self.sharedDefaults = (activeDefaults === localDefaults) ? nil : activeDefaults
+    }
+
+    @discardableResult
+    func reportIfNeeded() -> Bool {
+        guard let sharedDefaults else { return false }
+        guard MBPersistenceStorage.isInstalled(in: localDefaults),
+              MBPersistenceStorage.isInstalled(in: sharedDefaults) else { return false }
+
+        Logger.common(
+            message: "[Storage] Install state found in BOTH the local fallback store and the "
+                + "App Group suite. The device ran in local-storage fallback (App Group "
+                + "unavailable) and the App Group has since become available, so the install was "
+                + "re-registered on the shared container (deviceUUID stays stable, re-derived from IDFA/IDFV; "
+                + "in-app caps/counters reset).",
+            level: .info,
+            category: .general
+        )
+        return true
+    }
+}

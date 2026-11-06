@@ -1,0 +1,502 @@
+//
+//  OperationsURLRoutingTests.swift
+//  MindboxTests
+//
+//  Created by Sergei Semko on 4/27/26.
+//  Copyright © 2026 Mindbox. All rights reserved.
+//
+
+import Foundation
+import Testing
+@testable import Mindbox
+
+@Suite("Operations URL routing", .tags(.operationsRouting))
+struct OperationsURLRoutingTests {
+
+    private let domain = "api.maestra.io"
+    private let opsHost = "anonymizer-api-regular.client.example.com"
+
+    // MARK: - URLRequestBuilder host resolution
+
+    @Test("Event routes use operationsDomain when configured")
+    func eventRoutesUseOperationsDomain() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: opsHost)
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        #expect(try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url?.host == opsHost)
+        #expect(try builder.asURLRequest(route: EventRoute.customAsyncEvent(wrapper)).url?.host == opsHost)
+        #expect(try builder.asURLRequest(route: EventRoute.trackVisit(wrapper)).url?.host == opsHost)
+
+        let syncWrapper = Self.makeEventWrapper(.syncEvent, bodyJSON: #"{"name":"X","payload":"{}"}"#)
+        #expect(try builder.asURLRequest(route: EventRoute.syncEvent(syncWrapper)).url?.host == opsHost)
+
+        let logsWrapper = Self.makeEventWrapper(.sdkLogs)
+        #expect(try builder.asURLRequest(route: EventRoute.asyncEvent(logsWrapper)).url?.host == opsHost)
+    }
+
+    @Test("Config and geo routes always use domain")
+    func domainRoutesIgnoreOperationsDomain() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: opsHost)
+
+        let geoURL = try builder.asURLRequest(route: FetchInAppGeoRoute()).url
+        #expect(geoURL?.host == domain)
+        #expect(geoURL?.path == "/geo")
+    }
+
+    @Test("No operationsDomain → all routes fall back to domain (backwards compatibility)")
+    func noOperationsDomainFallsBackToDomain() throws {
+        let builder = URLRequestBuilder(domain: domain)
+        let wrapper = Self.makeEventWrapper(.installed)
+        let logsWrapper = Self.makeEventWrapper(.sdkLogs)
+
+        #expect(try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url?.host == domain)
+        #expect(try builder.asURLRequest(route: EventRoute.trackVisit(wrapper)).url?.host == domain)
+        #expect(try builder.asURLRequest(route: EventRoute.asyncEvent(logsWrapper)).url?.host == domain)
+        #expect(try builder.asURLRequest(route: FetchInAppGeoRoute()).url?.host == domain)
+    }
+
+    @Test("Path and query parameters survive host swap")
+    func pathAndQueryUnchangedOnHostSwap() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: opsHost)
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.path == "/v3/operations/async")
+        #expect(url?.query?.contains("operation=MobilePush.ApplicationInstalled") == true)
+        #expect(url?.query?.contains("endpointId=test-endpoint") == true)
+    }
+
+    // MARK: - Scheme handling (host-with-scheme passthrough)
+
+    @Test("Bare host gets default https:// scheme")
+    func bareHostUsesHttps() throws {
+        let builder = URLRequestBuilder(domain: "api.maestra.io")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "https")
+        #expect(url?.host == "api.maestra.io")
+    }
+
+    @Test("Explicit https:// in domain is preserved")
+    func explicitHttpsPreserved() throws {
+        let builder = URLRequestBuilder(domain: "https://api.maestra.io")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "https")
+        #expect(url?.host == "api.maestra.io")
+    }
+
+    @Test("Explicit http:// in domain is preserved (proxy/staging case)")
+    func explicitHttpPreserved() throws {
+        let builder = URLRequestBuilder(domain: "http://proxy.example.com")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "http")
+        #expect(url?.host == "proxy.example.com")
+    }
+
+    @Test("Bare operationsDomain gets default https:// scheme")
+    func bareOperationsDomainUsesHttps() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "anonymizer.client.example.com")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "https")
+        #expect(url?.host == "anonymizer.client.example.com")
+    }
+
+    @Test("Explicit https:// in operationsDomain is preserved")
+    func explicitHttpsInOperationsDomainPreserved() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "https://anonymizer.client.example.com")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "https")
+        #expect(url?.host == "anonymizer.client.example.com")
+    }
+
+    @Test("Explicit http:// in operationsDomain is preserved (proxy/staging case)")
+    func explicitHttpInOperationsDomainPreserved() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "http://anonymizer-staging.client.example.com")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "http")
+        #expect(url?.host == "anonymizer-staging.client.example.com")
+    }
+
+    @Test("Trailing slash in domain is stripped before path append")
+    func trailingSlashInDomainStripped() throws {
+        let builder = URLRequestBuilder(domain: "api.maestra.io/")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.path == "/v3/operations/async")
+        #expect(url?.host == "api.maestra.io")
+    }
+
+    @Test("Trailing slash in operationsDomain is stripped before path append")
+    func trailingSlashInOperationsDomainStripped() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "https://anonymizer.client.example.com/")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "https")
+        #expect(url?.host == "anonymizer.client.example.com")
+        #expect(url?.path == "/v3/operations/async")
+    }
+
+    @Test("Canonical form stored by policy routes correctly end-to-end")
+    func canonicalStoredFormRoutesCorrectly() throws {
+        let canonical = "https://anonymizer-api-regular.client.example.com"
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: canonical)
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "https")
+        #expect(url?.host == "anonymizer-api-regular.client.example.com")
+        #expect(url?.path == "/v3/operations/async")
+    }
+
+    // MARK: - Path prefix in operationsDomain
+
+    @Test("operationsDomain with path prefix appends operation endpoint after the prefix")
+    func pathPrefixAppendsEndpointAfterPrefix() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "https://api-v2.example.com/api/mindbox-regular")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "https")
+        #expect(url?.host == "api-v2.example.com")
+        #expect(url?.path == "/api/mindbox-regular/v3/operations/async")
+    }
+
+    @Test("Sync operations route keeps the path prefix")
+    func pathPrefixKeptOnSyncRoute() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "https://api-v2.example.com/api/mindbox-regular")
+        let syncWrapper = Self.makeEventWrapper(.syncEvent, bodyJSON: #"{"name":"X","payload":"{}"}"#)
+
+        let url = try builder.asURLRequest(route: EventRoute.syncEvent(syncWrapper)).url
+        #expect(url?.path == "/api/mindbox-regular/v3/operations/sync")
+    }
+
+    @Test("Bare host with path prefix gets default https:// and keeps the prefix")
+    func barePathPrefixUsesHttps() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "domain.com/api/v2")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.scheme == "https")
+        #expect(url?.host == "domain.com")
+        #expect(url?.path == "/api/v2/v3/operations/async")
+    }
+
+    @Test("Trailing slash after path prefix does not produce a double slash")
+    func trailingSlashAfterPathPrefixStripped() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "domain.com/api/v2/")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        let url = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper)).url
+        #expect(url?.path == "/api/v2/v3/operations/async")
+    }
+
+    @Test("Config and geo routes are unaffected by operations path prefix")
+    func domainRoutesUnaffectedByPathPrefix() throws {
+        let builder = URLRequestBuilder(domain: domain, operationsDomain: "https://api-v2.example.com/api/mindbox-regular")
+
+        let geoURL = try builder.asURLRequest(route: FetchInAppGeoRoute()).url
+        #expect(geoURL?.host == domain)
+        #expect(geoURL?.path == "/geo")
+    }
+
+    @Test("Fails fast when base URL is unparseable (no silent relative-URL request)")
+    func failsFastOnUnparseableBaseURL() {
+        let builder = URLRequestBuilder(domain: "bad host with spaces")
+        let wrapper = Self.makeEventWrapper(.installed)
+
+        #expect(throws: URLError.self) {
+            _ = try builder.asURLRequest(route: EventRoute.asyncEvent(wrapper))
+        }
+    }
+
+    // MARK: - Rollback signals from JSON config
+
+    @Test("Settings decodes explicit null as rollback signal", .tags(.decoding))
+    func settingsDecodesNullOperationsAsRollback() throws {
+        let json = """
+        { "settings": { "baseAddresses": { "operations": null } } }
+        """.data(using: .utf8)!
+
+        let response = try JSONDecoder().decode(ConfigResponse.self, from: json)
+        #expect(response.settings?.baseAddresses != nil)
+        #expect(response.settings?.baseAddresses?.operations == nil)
+    }
+
+    @Test("Settings decodes empty string as rollback signal", .tags(.decoding))
+    func settingsDecodesEmptyOperationsAsRollback() throws {
+        let json = """
+        { "settings": { "baseAddresses": { "operations": "" } } }
+        """.data(using: .utf8)!
+
+        let response = try JSONDecoder().decode(ConfigResponse.self, from: json)
+        #expect(response.settings?.baseAddresses?.operations == "")
+    }
+
+    // MARK: - Priority resolution (MBNetworkFetcher)
+
+    @Test("Priority — JSON wins when both JSON and init are set")
+    func priorityJSONWinsOverInit() {
+        let resolved = MBNetworkFetcher.resolveOperationsDomain(
+            fromConfigJSON: "json.example.com",
+            fromInit: "init.example.com"
+        )
+        #expect(resolved == "json.example.com")
+    }
+
+    @Test("Priority — init used when JSON has nothing")
+    func priorityInitUsedWhenJSONMissing() {
+        let resolved = MBNetworkFetcher.resolveOperationsDomain(
+            fromConfigJSON: nil,
+            fromInit: "init.example.com"
+        )
+        #expect(resolved == "init.example.com")
+    }
+
+    @Test("Priority — returns nil (→ domain fallback) when neither set")
+    func priorityNilWhenNeitherSet() {
+        let resolved = MBNetworkFetcher.resolveOperationsDomain(
+            fromConfigJSON: nil,
+            fromInit: nil
+        )
+        #expect(resolved == nil)
+    }
+
+    @Test("Priority — empty-string JSON treated as no value, falls through to init")
+    func priorityEmptyStringJSONFallsThrough() {
+        let resolved = MBNetworkFetcher.resolveOperationsDomain(
+            fromConfigJSON: "",
+            fromInit: "init.example.com"
+        )
+        #expect(resolved == "init.example.com")
+    }
+
+    @Test("Priority — empty-string init also treated as no value")
+    func priorityEmptyStringInitFallsThrough() {
+        let resolved = MBNetworkFetcher.resolveOperationsDomain(
+            fromConfigJSON: nil,
+            fromInit: ""
+        )
+        #expect(resolved == nil)
+    }
+
+    // MARK: - OperationsDomainConfigPolicy (decides save / clear / keep from JSON)
+
+    @Test("Policy — saves a new valid value when storage is empty")
+    func policySavesNewValueFromEmpty() {
+        #expect(OperationsDomainConfigPolicy.action(for: "x.example.com", currentlyStored: nil) == .save("https://x.example.com"))
+    }
+
+    @Test("Policy — saves when value changes")
+    func policySavesOnChange() {
+        #expect(OperationsDomainConfigPolicy.action(for: "new.example.com", currentlyStored: "https://old.example.com") == .save("https://new.example.com"))
+    }
+
+    @Test("Policy — keeps when incoming value equals stored")
+    func policyKeepsOnIdenticalValue() {
+        #expect(OperationsDomainConfigPolicy.action(for: "https://x.example.com", currentlyStored: "https://x.example.com") == .keep)
+    }
+
+    @Test("Policy — clears on null/missing config when something is stored (rollback)")
+    func policyClearsOnNullWhenStored() {
+        #expect(OperationsDomainConfigPolicy.action(for: nil, currentlyStored: "https://old.example.com") == .clear)
+    }
+
+    @Test("Policy — clears on empty string when something is stored (rollback)")
+    func policyClearsOnEmptyWhenStored() {
+        #expect(OperationsDomainConfigPolicy.action(for: "", currentlyStored: "https://old.example.com") == .clear)
+    }
+
+    @Test("Policy — clears on whitespace-only string when something is stored (Android parity)")
+    func policyClearsOnWhitespaceWhenStored() {
+        #expect(OperationsDomainConfigPolicy.action(for: "            ", currentlyStored: "https://old.example.com") == .clear)
+        #expect(OperationsDomainConfigPolicy.action(for: "\t\n  ", currentlyStored: "https://old.example.com") == .clear)
+    }
+
+    @Test("Policy — no-ops when nothing stored and nothing came")
+    func policyKeepsOnNothingToChange() {
+        #expect(OperationsDomainConfigPolicy.action(for: nil, currentlyStored: nil) == .keep)
+        #expect(OperationsDomainConfigPolicy.action(for: "", currentlyStored: nil) == .keep)
+        #expect(OperationsDomainConfigPolicy.action(for: "   ", currentlyStored: nil) == .keep)
+    }
+
+    @Test("Policy — trims surrounding whitespace before evaluating value")
+    func policyTrimsSurroundingWhitespace() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "  anonymizer.client.example.com  ", currentlyStored: "https://anonymizer.client.example.com")
+                == .keep
+        )
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "  new.client.example.com  ", currentlyStored: "https://old.example.com")
+                == .save("https://new.client.example.com")
+        )
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "  valid.host.example.com  ", currentlyStored: nil)
+                == .save("https://valid.host.example.com")
+        )
+    }
+
+    @Test("Policy — rejects format-broken incoming value (previous kept intact)")
+    func policyRejectsInvalidFormat() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "host with spaces", currentlyStored: "https://good.example.com")
+                == .rejected("host with spaces")
+        )
+    }
+
+    @Test("Policy — does NOT spuriously reject when canonical form matches stored (legacy raw)")
+    func policyDoesNotRejectOnLegacyRawMatch() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "x.example.com", currentlyStored: "https://x.example.com")
+                == .keep
+        )
+    }
+
+    @Test("Policy — normalizes scheme + trailing slash to canonical form")
+    func policyNormalizesSchemeAndTrailingSlash() {
+        #expect(
+            OperationsDomainConfigPolicy.action(
+                for: "https://anonymizer-api-regular.client.example.com/",
+                currentlyStored: nil
+            ) == .save("https://anonymizer-api-regular.client.example.com")
+        )
+    }
+
+    @Test("Policy — preserves http scheme from config (does not force https)")
+    func policyPreservesHttpScheme() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "http://x.example.com/", currentlyStored: nil)
+                == .save("http://x.example.com")
+        )
+    }
+
+    @Test("Policy — keeps when canonical form equals stored despite raw differences")
+    func policyKeepsWhenCanonicalFormMatches() {
+        #expect(
+            OperationsDomainConfigPolicy.action(
+                for: "https://x.example.com/",
+                currentlyStored: "https://x.example.com"
+            ) == .keep
+        )
+    }
+
+    @Test("Policy — upgrade path: legacy bare-host stored value re-saves once as canonical")
+    func policyUpgradesLegacyStoredValue() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "x.example.com", currentlyStored: "x.example.com")
+                == .save("https://x.example.com")
+        )
+    }
+
+    @Test("Policy — saves value with path prefix in canonical form")
+    func policySavesPathPrefixValue() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "api-v2.example.com/api/mindbox-regular", currentlyStored: nil)
+                == .save("https://api-v2.example.com/api/mindbox-regular")
+        )
+    }
+
+    @Test("Policy — normalizes trailing slash after path prefix")
+    func policyNormalizesTrailingSlashAfterPathPrefix() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "https://x.example.com/api/v2/", currentlyStored: nil)
+                == .save("https://x.example.com/api/v2")
+        )
+    }
+
+    @Test("Policy — keeps when canonical path-prefix form equals stored")
+    func policyKeepsOnMatchingPathPrefix() {
+        #expect(
+            OperationsDomainConfigPolicy.action(
+                for: "x.example.com/api/v2/",
+                currentlyStored: "https://x.example.com/api/v2"
+            ) == .keep
+        )
+    }
+
+    @Test("Policy — rejects path with query string")
+    func policyRejectsPathWithQuery() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "x.example.com/api?x=1", currentlyStored: "https://good.example.com")
+                == .rejected("x.example.com/api?x=1")
+        )
+    }
+
+    @Test("Policy — rejects empty path segment")
+    func policyRejectsEmptyPathSegment() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "x.example.com//api", currentlyStored: "https://good.example.com")
+                == .rejected("x.example.com//api")
+        )
+    }
+
+    @Test("Policy — accepts valid percent-encoded octet in path")
+    func policyAcceptsValidPercentEncoding() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "x.example.com/a%20b", currentlyStored: nil)
+                == .save("https://x.example.com/a%20b")
+        )
+    }
+
+    @Test("Policy — rejects non-hex percent escape from config")
+    func policyRejectsNonHexPercentEscape() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "x.example.com/a%zz", currentlyStored: "https://good.example.com")
+                == .rejected("x.example.com/a%zz")
+        )
+    }
+
+    @Test("Policy — rejects dangling percent at end of path from config")
+    func policyRejectsDanglingPercent() {
+        #expect(
+            OperationsDomainConfigPolicy.action(for: "x.example.com/a%", currentlyStored: "https://good.example.com")
+                == .rejected("x.example.com/a%")
+        )
+    }
+
+    // MARK: - Persistence lifecycle
+
+    @Test("softReset preserves operationsDomainFromConfig (no PD leak on migration reset)")
+    func softResetPreservesOperationsDomain() {
+        let storage = MockPersistenceStorage()
+        storage.operationsDomainFromConfig = "cached-anonymizer.example.com"
+        storage.configDownloadDate = Date()
+
+        storage.softReset()
+
+        #expect(storage.operationsDomainFromConfig == "cached-anonymizer.example.com")
+        #expect(storage.configDownloadDate == nil)
+    }
+
+    @Test("reset clears operationsDomainFromConfig (test-only hard reset)")
+    func hardResetClearsOperationsDomain() {
+        let storage = MockPersistenceStorage()
+        storage.operationsDomainFromConfig = "cached.example.com"
+
+        storage.reset()
+
+        #expect(storage.operationsDomainFromConfig == nil)
+    }
+
+    // MARK: - Helpers
+
+    private static func makeEventWrapper(
+        _ type: Event.Operation,
+        bodyJSON: String = "{}"
+    ) -> EventWrapper {
+        let event = Event(type: type, body: bodyJSON)
+        return EventWrapper(event: event, endpoint: "test-endpoint", deviceUUID: "F47AC10B-58CC-4372-A567-0E02B2C3D479")
+    }
+}

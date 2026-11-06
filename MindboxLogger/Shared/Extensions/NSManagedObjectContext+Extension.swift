@@ -1,0 +1,50 @@
+//
+//  Extension.swift
+//  MindboxLogger
+//
+//  Created by Akylbek Utekeshev on 06.02.2023.
+//  Copyright © 2023 Mikhail Barilov. All rights reserved.
+//
+
+import Foundation
+import CoreData
+
+public extension NSManagedObjectContext {
+
+    func executePerformAndWait<T>(_ block: () throws -> T) rethrows -> T {
+        if #available(iOS 15, *) {
+            try self.performAndWait(block)
+        } else {
+            try mindboxPerformAndWait(block)
+        }
+    }
+
+    func mindboxPerformAndWait<T>(_ block: () throws -> T) rethrows -> T {
+        return try _performAndWaitHelper(
+            fn: performAndWait, execute: block, rescue: { throw $0 }
+        )
+    }
+
+    // Source: https://github.com/apple/swift/blob/bb157a070ec6534e4b534456d208b03adc07704b/stdlib/public/SDK/Dispatch/Queue.swift#L228-L249
+    private func _performAndWaitHelper<T>(
+        fn: (() -> Void) -> Void,
+        execute work: () throws -> T,
+        rescue: ((Error) throws -> (T))) rethrows -> T {
+        var result: T?
+        var error: Error?
+        withoutActuallyEscaping(work) { _work in
+            fn {
+                do {
+                    result = try _work()
+                } catch let e {
+                    error = e
+                }
+            }
+        }
+        if let e = error {
+            return try rescue(e)
+        } else {
+            return result! // swiftlint:disable:this force_unwrapping
+        }
+    }
+}

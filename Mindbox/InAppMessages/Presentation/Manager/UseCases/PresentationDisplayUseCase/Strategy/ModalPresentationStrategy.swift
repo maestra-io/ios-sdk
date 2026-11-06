@@ -1,0 +1,67 @@
+//
+//  ModalPresentationStrategy.swift
+//  Mindbox
+//
+//  Created by vailence on 18.07.2023.
+//  Copyright © 2023 Mindbox. All rights reserved.
+//
+
+import UIKit
+import MindboxLogger
+
+final class ModalPresentationStrategy: PresentationStrategyProtocol {
+    var window: UIWindow?
+
+    func getWindow() -> UIWindow? {
+        return makeInAppMessageWindow()
+    }
+
+    func present(id: String, in window: UIWindow, using viewController: UIViewController) -> Bool {
+        window.rootViewController = viewController
+        window.isHidden = false
+        Logger.common(message: "In-app modal with id \(id) presented", level: .info, category: .inAppMessages)
+        return true
+    }
+
+    func dismiss(viewController: UIViewController) {
+        viewController.view.window?.isHidden = true
+        viewController.view.window?.rootViewController = nil
+        Logger.common(message: "In-app modal presentation dismissed", level: .debug, category: .inAppMessages)
+    }
+
+    func setupWindowFrame(model: MindboxFormVariant, imageSize: CGSize) {
+    }
+
+    private func makeInAppMessageWindow() -> UIWindow? {
+        let window: UIWindow?
+        if #available(iOS 13.0, *) {
+            window = iOS13PlusWindow
+        } else {
+            window = nil
+        }
+        self.window = window
+        window?.windowLevel = .normal + 3
+        window?.isHidden = false
+        return window
+    }
+
+    @available(iOS 13.0, *)
+    private var mostSuitableScene: UIWindowScene? {
+        for connectedScene in UIApplication.shared.connectedScenes {
+            if let windowScene = connectedScene as? UIWindowScene, connectedScene.activationState == .foregroundActive {
+                return windowScene
+            }
+        }
+
+        return UIApplication.shared.connectedScenes.first as? UIWindowScene
+    }
+
+    @available(iOS 13.0, *)
+    private var iOS13PlusWindow: UIWindow? {
+        if let mostSuitableScene = mostSuitableScene {
+            return UIWindow(windowScene: mostSuitableScene)
+        } else {
+            return nil
+        }
+    }
+}

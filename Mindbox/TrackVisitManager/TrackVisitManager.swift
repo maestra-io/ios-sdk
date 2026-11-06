@@ -1,0 +1,135 @@
+//
+//  TrackVistiManager.swift
+//  Mindbox
+//
+//  Created by Maksim Kazachkov on 15.04.2021.
+//  Copyright © 2021 Mindbox. All rights reserved.
+//
+
+import UIKit
+import MindboxLogger
+
+protocol TrackVisitCommonTrackProtocol {
+    func track(_ type: TrackVisitType) throws
+    func track(data: TrackVisitData) throws
+}
+
+protocol TrackVisitSpecificTrackProtocol {
+    func trackForeground() throws
+    func trackDirect() throws
+}
+
+protocol TrackVisitManagerProtocol: TrackVisitCommonTrackProtocol, TrackVisitSpecificTrackProtocol {}
+
+final class TrackVisitManager: TrackVisitManagerProtocol {
+    private let databaseRepository: DatabaseRepositoryProtocol
+    private let inappSessionManager: InappSessionManagerProtocol
+
+    @Locked private var skipNextDirectTrackVisit = false
+
+    init(
+        databaseRepository: DatabaseRepositoryProtocol,
+        inappSessionManager: InappSessionManagerProtocol
+    ) {
+        self.databaseRepository = databaseRepository
+        self.inappSessionManager = inappSessionManager
+    }
+
+    func track(_ type: TrackVisitType) throws {
+        switch type {
+        case let .launch(options), let .launchScene(options):
+            try handleLaunch(options)
+        case let .universalLink(userActivity):
+            try handleUniversalLink(userActivity)
+        case let .push(response):
+            try handlePush(response)
+        }
+    }
+
+    @objc
+    func track(data: TrackVisitData) throws {
+        if let userActivity = data.universalLink {
+            try handleUniversalLink(userActivity)
+        } else if let response = data.push {
+            try handlePush(response)
+        } else if #available(iOS 13.0, *), let sceneOptions = data.sceneOptions as? UIScene.ConnectionOptions {
+            try handleLaunch(sceneOptions)
+        } else if let launchOptions = data.launchOptions {
+            try handleLaunch(launchOptions)
+        }
+    }
+
+    func trackForeground() throws {
+        let encodable = TrackVisit()
+        Logger.common(message: "Tracked Visit event type foreground", level: .info, category: .visit)
+        try sendTrackVisit(encodable)
+    }
+
+    func trackDirect() throws {
+        if $skipNextDirectTrackVisit.exchange(false) {
+            Logger.common(message: "Skipping trackDirect because push or universal link track visit already sent", level: .info, category: .visit)
+            inappSessionManager.checkInappSession()
+            return
+        }
+        let encodable = TrackVisit(source: .direct)
+        SessionTemporaryStorage.shared.lastTrackVisit = (source: .direct, requestUrl: nil)
+        Logger.common(message: "Tracked Visit event type direct", level: .info, category: .visit)
+        try sendTrackVisit(encodable)
+    }
+
+    private func handleLaunch(_ options: LaunchOptions?) throws {
+        guard let options = options else { return }
+
+        if #available(iOS 13.0, *),
+           case let sceneOptions as UIScene.ConnectionOptions = options,
+           let userActivity = sceneOptions.userActivities.first,
+           userActivity.activityType == NSUserActivityTypeBrowsingWeb {
+            try handleUniversalLink(userActivity)
+        }
+    }
+
+    private func handleUniversalLink(_ userActivity: NSUserActivity) throws {
+        skipNextDirectTrackVisit = true
+        let encodable = TrackVisit(url: userActivity.webpageURL, source: .link)
+        SessionTemporaryStorage.shared.lastTrackVisit = (source: .link, requestUrl: userActivity.webpageURL?.absoluteString)
+        try sendTrackVisit(encodable)
+        Logger.common(message: "Tracked Visit event type: universal link", level: .info, category: .visit)
+    }
+
+    private func handlePush(_ response: UNNotificationResponse) throws {
+        skipNextDirectTrackVisit = true
+        let encodable = TrackVisit(source: .push)
+        SessionTemporaryStorage.shared.lastTrackVisit = (source: .push, requestUrl: nil)
+        try sendTrackVisit(encodable)
+        Logger.common(message: "Tracked Visit event type: push", level: .info, category: .visit)
+    }
+
+    private func sendTrackVisit<E: Encodable>(_ encodable: E) throws {
+        defer { inappSessionManager.checkInappSession() }
+
+        let event = Event(type: .trackVisit, body: BodyEncoder(encodable: encodable).body)
+        try databaseRepository.create(event: event)
+    }
+}
+
+public enum TrackVisitType {
+    case universalLink(NSUserActivity)
+    case push(UNNotificationResponse)
+    case launch(LaunchOptions?)
+    case launchScene(LaunchOptions?)
+}
+
+@objcMembers
+public class TrackVisitData: NSObject {
+    public var universalLink: NSUserActivity?
+    public var push: UNNotificationResponse?
+    public var launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    public var sceneOptions: Any?
+}
+
+public protocol LaunchOptions {}
+
+extension Dictionary: LaunchOptions where Key == UIApplication.LaunchOptionsKey, Value == Any {}
+
+@available(iOS 13.0, *)
+extension UIScene.ConnectionOptions: LaunchOptions {}

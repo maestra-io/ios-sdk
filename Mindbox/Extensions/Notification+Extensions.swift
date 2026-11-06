@@ -1,0 +1,22 @@
+//
+//  Notification+Extensions.swift
+//  Mindbox
+//
+//  Created by Sergei Semko on 4/28/24.
+//  Copyright © 2024 Mindbox. All rights reserved.
+//
+
+import Foundation
+
+extension Notification.Name {
+    static let initializationCompleted = Notification.Name("MBNotification-initializationCompleted")
+    static let shouldDiscardInapps = Notification.Name("MBNotification-shouldDiscardInapps")
+    static let mobileConfigDownloaded = Notification.Name("MBNotification-mobileConfigDownloaded")
+
+    static let mobileConfigDownloadConcluded = Notification.Name("MBNotification-mobileConfigDownloadConcluded")
+
+    static let inappSessionChecked = Notification.Name("MBNotification-inappSessionChecked")
+
+    static let inAppOperationOccurred = Notification.Name("MBNotification-inAppOperationOccurred")
+    static let receivedPushTokenKeepaliveFromTheMobileConfig = Notification.Name("MBNotification-receivedPushTokenKeepaliveFromTheMobileConfig")
+}

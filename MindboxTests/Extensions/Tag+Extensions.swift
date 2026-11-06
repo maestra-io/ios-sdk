@@ -1,0 +1,35 @@
+//
+//  Tag+Extensions.swift
+//  MindboxTests
+//
+//  Created by vailence on 29.11.2024.
+//  Copyright © 2024 Mindbox. All rights reserved.
+//
+
+import Foundation
+import Testing
+
+extension Tag {
+    @Tag static var sdkVersion: Self
+    @Tag static var customOperation: Self
+    @Tag static var category: Self
+    @Tag static var product: Self
+    @Tag static var productSegment: Self
+    
+    @Tag static var decoding: Self
+    
+    @Tag static var inAppSchedule: Self
+    
+    @Tag static var remainingTargeting: Self
+    @Tag static var abTesting: Self
+    @Tag static var geoTargeting: Self
+    @Tag static var webView: Self
+    @Tag static var trackVisit: Self
+    @Tag static var operationsRouting: Self
+    @Tag static var mbConfiguration: Self
+    @Tag static var inAppTags: Self
+    @Tag static var userAgent: Self
+    @Tag static var dependencyInjection: Self
+    @Tag static var embeddedBlocks: Self
+    @Tag static var inappSelection: Self
+}

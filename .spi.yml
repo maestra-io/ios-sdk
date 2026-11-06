@@ -1,0 +1,5 @@
+version: 1
+metadata:
+  authors: "Maestra"
+external_links:
+  documentation: "https://developers.maestra.io/docs/ios-sdk-integration"

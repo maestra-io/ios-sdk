@@ -1,0 +1,57 @@
+//
+//  InAppMessage.swift
+//  Mindbox
+//
+//  Created by Maksim Kazakov on 06.09.2022.
+//  Copyright © 2022 Mikhail Barilov. All rights reserved.
+//
+
+import Foundation
+import UIKit
+
+struct InAppFormData {
+    let inAppId: String
+    let isPriority: Bool
+    let delayTime: String?
+    let imagesDict: [String: UIImage]
+    let firstImageValue: String
+    let content: MindboxFormVariant
+    let frequency: InappFrequency?
+    let tags: [String: String]?
+    var operation: (name: String, body: String)?
+
+    let extraParams: [String: JSONValue]?
+
+    init(
+        inAppId: String,
+        isPriority: Bool,
+        delayTime: String?,
+        imagesDict: [String: UIImage],
+        firstImageValue: String,
+        content: MindboxFormVariant,
+        frequency: InappFrequency?,
+        tags: [String: String]? = nil,
+        operation: (name: String, body: String)? = nil,
+        extraParams: [String: JSONValue]? = nil
+    ) {
+        self.inAppId = inAppId
+        self.isPriority = isPriority
+        self.delayTime = delayTime
+        self.imagesDict = imagesDict
+        self.firstImageValue = firstImageValue
+        self.content = content
+        self.frequency = frequency
+        self.tags = tags
+        self.operation = operation
+        self.extraParams = extraParams
+    }
+}
+
+struct InAppTransitionData: Equatable {
+    let inAppId: String
+    let isPriority: Bool
+    let delayTime: String?
+    let content: MindboxFormVariant
+    let frequency: InappFrequency?
+    let tags: [String: String]?
+}

@@ -1,0 +1,1278 @@
+//
+//  InappScheduleManagerTests.swift
+//  MindboxTests
+//
+//  Created by Akylbek Utekeshev on 04.07.2025.
+//  Copyright © 2025 Mindbox. All rights reserved.
+//
+
+import Testing
+import MindboxLogger
+import QuartzCore
+import UIKit
+@testable import Mindbox
+
+@Suite("In-app schedule manager tests")
+struct InappScheduleManagerTests {
+
+    private var scheduleManager: InappScheduleManager
+    private var presentationManagerMock: InAppPresentationManagerMock
+    private var trackingServiceMock: InAppTrackingServiceMock
+    private var failureManagerMock: InappShowFailureManagerMock
+    private var budget: InappShowBudget
+    private let host: HostApp
+
+    private final class HostApp {
+        var isInBackground = false
+        var clockOffset: TimeInterval = 0
+        var now: Date { Date().addingTimeInterval(clockOffset) }
+    }
+
+    init() {
+        TestConfiguration.configure()
+
+        presentationManagerMock = InAppPresentationManagerMock()
+        trackingServiceMock = InAppTrackingServiceMock()
+        failureManagerMock = InappShowFailureManagerMock()
+        budget = InappShowBudget(persistenceStorage: DI.injectOrFail(PersistenceStorage.self), trackingService: trackingServiceMock)
+
+        let host = HostApp()
+        self.host = host
+        scheduleManager = InappScheduleManager(
+            presentationManager: presentationManagerMock,
+            budget: budget,
+            accountant: InappShowAccountant(tracker: DI.injectOrFail(InAppMessagesTracker.self), budget: budget),
+            failureManager: failureManagerMock,
+            isInBackground: { host.isInBackground },
+            now: { host.now }
+        )
+
+        SessionTemporaryStorage.shared.erase()
+    }
+
+    // MARK: - No delay
+
+    @Test("In-app without delay is presented exactly once and the queue is cleaned up, whether its own timer or the test fires first", .tags(.inAppSchedule))
+    func scheduleInapp_noDelay_schedulesCorrectly() async {
+        #expect(scheduleManager.inappsByPresentationTime.isEmpty)
+
+        let inapp = createInAppFormData(id: "1", isPriority: false, delayTime: nil)
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+        scheduleManager.queue.sync {
+            presentationTime = self.scheduleManager.inappsByPresentationTime.keys.first
+        }
+
+        if let presentationTime {
+            scheduleManager.showEligibleInapp(presentationTime)
+        }
+        await awaitSchedule()
+
+        scheduleManager.queue.sync {
+            #expect(self.presentationManagerMock.presentCallsCount == 1)
+            #expect(self.presentationManagerMock.receivedInAppUIModel?.inAppId == inapp.inAppId)
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+        }
+    }
+
+    // MARK: - Small delay (logic-level, not real time)
+
+    @Test("In-app with small delay is scheduled and presented when eligible", .tags(.inAppSchedule))
+    func scheduleInApp_smallDelay_schedulesCorrectly() async {
+        #expect(scheduleManager.inappsByPresentationTime.isEmpty)
+
+        let inapp = createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02")
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+
+        scheduleManager.queue.sync {
+            #expect(self.scheduleManager.inappsByPresentationTime.count == 1)
+            presentationTime = self.scheduleManager.inappsByPresentationTime.keys.first
+
+            let storedInapp = self.scheduleManager.inappsByPresentationTime.values.first?.first?.inapp
+            #expect(storedInapp?.inAppId == inapp.inAppId)
+            #expect(self.presentationManagerMock.presentCallsCount == 0)
+        }
+
+        guard let time = presentationTime else {
+            Issue.record("Expected presentationTime to be set")
+            return
+        }
+
+        scheduleManager.showEligibleInapp(time)
+        await awaitSchedule()
+
+        scheduleManager.queue.sync {
+            #expect(self.presentationManagerMock.presentCallsCount == 1)
+            #expect(self.presentationManagerMock.receivedInAppUIModel?.inAppId == inapp.inAppId)
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+        }
+    }
+
+    // MARK: - Multiple in-apps with different times
+
+    @Test("Multiple in-apps with different delays schedule correctly and only earliest is shown", .tags(.inAppSchedule))
+    func scheduleMultipleInapp_smallDelay_schedulesCorrectly() async {
+        #expect(scheduleManager.inappsByPresentationTime.isEmpty)
+
+        let inapp1 = createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02")
+        let inapp2 = createInAppFormData(id: "2", isPriority: false, delayTime: "00:00:03")
+        let inapp3 = createInAppFormData(id: "3", isPriority: true, delayTime: "00:00:04")
+
+        scheduleManager.scheduleInApp(inapp1, processingDuration: 0)
+        scheduleManager.scheduleInApp(inapp2, processingDuration: 0)
+        scheduleManager.scheduleInApp(inapp3, processingDuration: 0)
+
+        var entries: [(time: TimeInterval, inappId: String)] = []
+
+        scheduleManager.queue.sync {
+            #expect(self.scheduleManager.inappsByPresentationTime.count == 3)
+            #expect(self.presentationManagerMock.presentCallsCount == 0)
+
+            for (time, scheduled) in self.scheduleManager.inappsByPresentationTime {
+                guard let first = scheduled.first else {
+                    Issue.record("Expected at least one scheduled in-app for time \(time)")
+                    continue
+                }
+                entries.append((time: time, inappId: first.inapp.inAppId))
+            }
+        }
+
+        #expect(entries.count == 3)
+
+        let earliest = entries.min { $0.time < $1.time }
+        #expect(earliest?.inappId == inapp1.inAppId)
+
+        let sortedTimes = entries.map { $0.time }.sorted()
+        for time in sortedTimes {
+            scheduleManager.showEligibleInapp(time)
+        }
+        await awaitSchedule()
+
+        scheduleManager.queue.sync {
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+            #expect(self.presentationManagerMock.presentCallsCount == 1)
+            #expect(self.presentationManagerMock.receivedInAppUIModel?.inAppId == inapp1.inAppId)
+        }
+    }
+
+    @Test("A delayed in-app whose time comes while another is on screen is dropped, closing that one does not show it", .tags(.inAppSchedule))
+    func scheduleInapp_missedMomentBehindAnotherInapp_isDropped() async throws {
+        let onScreen = createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02")
+        let late = createInAppFormData(id: "2", isPriority: false, delayTime: "00:00:02")
+        scheduleManager.scheduleInApp(onScreen, processingDuration: 0)
+        let onScreenTime = try #require(scheduleManager.queue.sync { scheduleManager.inappsByPresentationTime.keys.first })
+        scheduleManager.showEligibleInapp(onScreenTime)
+        await awaitSchedule()
+        scheduleManager.queue.sync {
+            #expect(self.presentationManagerMock.receivedInAppUIModel?.inAppId == onScreen.inAppId)
+        }
+
+        scheduleManager.scheduleInApp(late, processingDuration: 0)
+        let lateTime = try #require(scheduleManager.queue.sync { scheduleManager.inappsByPresentationTime.keys.first })
+        scheduleManager.showEligibleInapp(lateTime)
+        await awaitSchedule()
+        scheduleManager.queue.sync {
+            #expect(self.presentationManagerMock.presentCallsCount == 1)
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+        }
+
+        presentationManagerMock.closeActiveInApp()
+
+        scheduleManager.queue.sync {
+            #expect(self.presentationManagerMock.presentCallsCount == 1)
+        }
+    }
+
+    // MARK: - Records deletion
+
+    @Test("Scheduled entries are removed after in-app is shown", .tags(.inAppSchedule))
+    func scheduleInapp_successShow_recordsDeleted() {
+        #expect(scheduleManager.inappsByPresentationTime.isEmpty)
+
+        let inapp = createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02")
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+
+        scheduleManager.queue.sync {
+            #expect(!self.scheduleManager.inappsByPresentationTime.isEmpty)
+            presentationTime = self.scheduleManager.inappsByPresentationTime.keys.first
+        }
+
+        guard let time = presentationTime else {
+            Issue.record("Expected presentationTime to be set")
+            return
+        }
+
+        scheduleManager.showEligibleInapp(time)
+
+        scheduleManager.queue.sync {
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+        }
+    }
+
+    @Test("Eligible in-app cleanup leaves the failure buffer alone", .tags(.inAppSchedule))
+    func showEligibleInapp_leavesFailuresAlone() {
+        let inapp = createInAppFormData(id: "keep-failures", isPriority: false, delayTime: "00:01:00")
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+        scheduleManager.queue.sync {
+            presentationTime = self.scheduleManager.inappsByPresentationTime.keys.first
+        }
+
+        guard let presentationTime else {
+            Issue.record("Expected presentationTime to be set")
+            return
+        }
+
+        scheduleManager.showEligibleInapp(presentationTime)
+
+        scheduleManager.queue.sync {
+            #expect(self.failureManagerMock.sendFailuresCallCount == 0)
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+        }
+    }
+
+    // MARK: - Invalid / zero delay
+
+    @Test("Invalid delay string falls back to zero and in-app is presented, whether its own timer or the test fires first", .tags(.inAppSchedule))
+    func scheduleInapp_withInvalidDelayTime_usesDefaultDelay() async {
+        let inapp = createInAppFormData(id: "1", isPriority: false, delayTime: "invalid_time")
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+        scheduleManager.queue.sync {
+            presentationTime = self.scheduleManager.inappsByPresentationTime.keys.first
+        }
+
+        if let presentationTime {
+            scheduleManager.showEligibleInapp(presentationTime)
+        }
+        await awaitSchedule()
+
+        scheduleManager.queue.sync {
+            #expect(self.presentationManagerMock.presentCallsCount == 1)
+            #expect(self.presentationManagerMock.receivedInAppUIModel?.inAppId == inapp.inAppId)
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+        }
+    }
+
+    @Test("Zero delay is treated as immediate and in-app is presented, whether its own timer or the test fires first", .tags(.inAppSchedule))
+    func scheduleInapp_withZeroDelay_schedulesCorrectly() async {
+        let inapp = createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:00")
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+        scheduleManager.queue.sync {
+            presentationTime = self.scheduleManager.inappsByPresentationTime.keys.first
+        }
+
+        if let presentationTime {
+            scheduleManager.showEligibleInapp(presentationTime)
+        }
+        await awaitSchedule()
+
+        scheduleManager.queue.sync {
+            #expect(self.presentationManagerMock.presentCallsCount == 1)
+            #expect(self.presentationManagerMock.receivedInAppUIModel?.inAppId == inapp.inAppId)
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+        }
+    }
+
+    // MARK: - Large delay
+
+    @Test("In-app with large delay is scheduled at expected time", .tags(.inAppSchedule))
+    func scheduleInApp_withLargeDelay_schedulesCorrectly() {
+        #expect(scheduleManager.inappsByPresentationTime.isEmpty)
+
+        let inapp = createInAppFormData(id: "1", isPriority: false, delayTime: "01:00:00")
+        let start = Date().timeIntervalSince1970
+
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var scheduledTime: TimeInterval?
+
+        scheduleManager.queue.sync {
+            #expect(self.scheduleManager.inappsByPresentationTime.count == 1)
+            scheduledTime = self.scheduleManager.inappsByPresentationTime.keys.first
+
+            let scheduledInapp = self.scheduleManager.inappsByPresentationTime.values.first?.first?.inapp
+            #expect(scheduledInapp?.inAppId == inapp.inAppId)
+        }
+
+        guard let time = scheduledTime else {
+            Issue.record("Expected scheduledTime to be set")
+            return
+        }
+
+        let oneHour: TimeInterval = 3600
+        let tolerance: TimeInterval = 1
+
+        #expect(time >= start + oneHour - tolerance)
+        #expect(time <= start + oneHour + tolerance)
+    }
+
+    // MARK: - Priority selection
+
+    @Test("When multiple in-apps share the same time, priority one is shown", .tags(.inAppSchedule))
+    func multipleInAppsOnSameTime_schedulesCorrectly_shownSecond() async {
+        #expect(scheduleManager.inappsByPresentationTime.isEmpty)
+
+        let inapp1 = createInAppFormData(id: "1", isPriority: false, delayTime: "01:00:00")
+        let inapp2 = createInAppFormData(id: "2", isPriority: true, delayTime: "01:00:00")
+        let inapp3 = createInAppFormData(id: "3", isPriority: false, delayTime: "01:00:00")
+
+        scheduleManager.scheduleInApp(inapp1, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+
+        scheduleManager.queue.sync {
+            guard
+                let entry = self.scheduleManager.inappsByPresentationTime.first,
+                let existingScheduled = entry.value.first
+            else {
+                Issue.record("Expected one scheduled in-app")
+                return
+            }
+
+            presentationTime = entry.key
+
+            let scheduledInapp1 = ScheduledInapp(inapp: inapp1, timer: existingScheduled.timer, processingDuration: 0)
+            let scheduledInapp2 = ScheduledInapp(inapp: inapp2, timer: existingScheduled.timer, processingDuration: 0)
+            let scheduledInapp3 = ScheduledInapp(inapp: inapp3, timer: existingScheduled.timer, processingDuration: 0)
+
+            self.scheduleManager.inappsByPresentationTime[entry.key] = [
+                scheduledInapp1,
+                scheduledInapp2,
+                scheduledInapp3
+            ]
+        }
+
+        guard let time = presentationTime else {
+            Issue.record("Expected presentationTime to be set")
+            return
+        }
+
+        scheduleManager.showEligibleInapp(time)
+        await awaitSchedule()
+
+        scheduleManager.queue.sync {
+            #expect(self.scheduleManager.inappsByPresentationTime.isEmpty)
+            #expect(self.presentationManagerMock.presentCallsCount == 1)
+            #expect(self.presentationManagerMock.receivedInAppUIModel?.inAppId == inapp2.inAppId)
+        }
+    }
+    
+    @Test("In-app success callback leaves the failure buffer alone", .tags(.inAppSchedule))
+    func presentInapp_onPresented_leavesFailuresAlone() {
+        let inapp = createInAppFormData(id: "success-id", isPriority: false, delayTime: nil)
+
+        scheduleManager.presentInapp(inapp, stopwatch: ForegroundStopwatch())
+        #expect(presentationManagerMock.presentCallsCount == 1)
+
+        presentationManagerMock.receivedOnPresent?()
+        #expect(failureManagerMock.sendFailuresCallCount == 0)
+        #expect(failureManagerMock.addFailureCallCount == 0)
+    }
+    
+    @Test("In-app error callback sends its own failure and leaves the buffer of other passes alone", .tags(.inAppSchedule))
+    func presentInapp_onError_sendsItsFailurePastTheBuffer() {
+        let inapp = createInAppFormData(id: "error-id", isPriority: false, delayTime: nil)
+
+        scheduleManager.presentInapp(inapp, stopwatch: ForegroundStopwatch())
+        #expect(presentationManagerMock.presentCallsCount == 1)
+
+        presentationManagerMock.receivedOnError?(.failedToLoadWindow)
+        #expect(failureManagerMock.sentFailures.map(\.inappId) == ["error-id"])
+        #expect(failureManagerMock.sendFailuresCallCount == 0)
+        #expect(failureManagerMock.addFailureCallCount == 0)
+    }
+
+    @Test("In-app error callback propagates the in-app tags into the show failure", .tags(.inAppSchedule, .inAppTags))
+    func presentInapp_onError_propagatesTags() {
+        let tags = ["templateType": "Modal"]
+        let inapp = createInAppFormData(id: "error-tags-id", isPriority: false, delayTime: nil, tags: tags)
+
+        scheduleManager.presentInapp(inapp, stopwatch: ForegroundStopwatch())
+        presentationManagerMock.receivedOnError?(.failedToLoadWindow)
+
+        #expect(failureManagerMock.sentFailures.first?.tags == tags)
+    }
+
+    @Test("In-app error callback maps error to show failure payload", .tags(.inAppSchedule))
+    func presentInapp_onError_mapsToFailureReasonAndDetails() {
+        let cases: [(InAppPresentationError, InAppShowFailureReason, String)] = [
+            (.failedToLoadImages, .presentationFailed, "[InAppPresentationError] Failed to load images."),
+            (.failedToLoadWindow, .presentationFailed, "[InAppPresentationError] Failed to load window."),
+            (.failed("presentation-failed-details"), .presentationFailed, "presentation-failed-details"),
+            (.webviewLoadFailed("webview-load-details"), .webviewLoadFailed, "webview-load-details"),
+            (.webviewPresentationFailed("webview-presentation-details"), .webviewPresentationFailed, "webview-presentation-details")
+        ]
+
+        for (index, testCase) in cases.enumerated() {
+            let (error, expectedReason, expectedDetails) = testCase
+            let inapp = createInAppFormData(id: "error-map-\(index)", isPriority: false, delayTime: nil)
+
+            scheduleManager.presentInapp(inapp, stopwatch: ForegroundStopwatch())
+            presentationManagerMock.receivedOnError?(error)
+
+            #expect(failureManagerMock.sentFailures.count == index + 1)
+
+            let call = failureManagerMock.sentFailures[index]
+            #expect(call.inappId == inapp.inAppId)
+            #expect(call.reason == expectedReason)
+            #expect(call.details == expectedDetails)
+        }
+    }
+
+    @Test("In-app error callback is handled once per presentation", .tags(.inAppSchedule))
+    func presentInapp_onError_isSingleShot() {
+        let inapp = createInAppFormData(id: "single-shot-id", isPriority: false, delayTime: nil)
+
+        scheduleManager.presentInapp(inapp, stopwatch: ForegroundStopwatch())
+
+        presentationManagerMock.receivedOnError?(.failed("first-error"))
+        presentationManagerMock.receivedOnError?(.failed("second-error"))
+
+        #expect(failureManagerMock.sentFailures.count == 1)
+        #expect(failureManagerMock.sentFailures.first?.details == "first-error")
+    }
+
+    private final class DelegateSpy: InAppMessagesDelegate {
+        private(set) var dismissedIds: [String] = []
+
+        func inAppMessageTapAction(id: String, url: URL?, payload: String) {}
+
+        func inAppMessageDismissed(id: String) {
+            dismissedIds.append(id)
+        }
+    }
+
+    @Test("A show discarded by a session reset moves no cooldown and tells the delegate nothing", .tags(.inAppSchedule))
+    func discardedShow_movesNoCooldownAndIsNotReportedDismissed() {
+        let spy = DelegateSpy()
+        scheduleManager.delegate = spy
+        scheduleManager.presentInapp(createInAppFormData(id: "discarded", isPriority: false, delayTime: nil),
+                                     stopwatch: ForegroundStopwatch())
+        presentationManagerMock.receivedOnPresent?()
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 1)
+
+        presentationManagerMock.discardActiveInApp()
+
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 1)
+        #expect(spy.dismissedIds.isEmpty)
+    }
+
+    @Test("A user's close moves the cooldown and is reported to the delegate", .tags(.inAppSchedule))
+    func closedShow_movesTheCooldownAndIsReportedDismissed() {
+        let spy = DelegateSpy()
+        scheduleManager.delegate = spy
+        scheduleManager.presentInapp(createInAppFormData(id: "closed", isPriority: false, delayTime: nil),
+                                     stopwatch: ForegroundStopwatch())
+        presentationManagerMock.receivedOnPresent?()
+
+        presentationManagerMock.closeActiveInApp()
+
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 2)
+        #expect(spy.dismissedIds == ["closed"])
+    }
+
+    // MARK: - A show on request
+
+    private func makeSpiedManager(tracker: InAppMessagesTrackerSpyMock) -> InappScheduleManager {
+        InappScheduleManager(
+            presentationManager: presentationManagerMock,
+            budget: budget,
+            accountant: InappShowAccountant(tracker: tracker, budget: budget),
+            failureManager: failureManagerMock,
+            isInBackground: { false }
+        )
+    }
+
+    private func showNowAndAwaitMainQueue(_ manager: InappScheduleManager,
+                                          _ inapp: InAppFormData,
+                                          processingDuration: TimeInterval = 0) async {
+        manager.showInAppNow(inapp, processingDuration: processingDuration, proceedIf: { true }) { _ in }
+        await awaitMainQueue()
+    }
+
+    private func awaitMainQueue(turns: Int = 1) async {
+        for _ in 0..<turns {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+    }
+
+    private func awaitSchedule() async {
+        scheduleManager.queue.sync {}
+        await awaitMainQueue()
+    }
+
+    @Test("An unlimited show on request sends the event but records nothing", .tags(.inAppSchedule))
+    func showInAppNow_unlimitedRecordsNothing() async {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let inapp = createInAppFormData(id: "direct-1", isPriority: false, delayTime: nil, frequency: .unlimited)
+
+        await showNowAndAwaitMainQueue(manager, inapp)
+
+        #expect(presentationManagerMock.presentCallsCount == 1)
+
+        presentationManagerMock.receivedOnPresent?()
+        presentationManagerMock.receivedOnPresentationCompleted?(false)
+
+        #expect(trackerSpy.trackViewCallCount == 1)
+        #expect(trackerSpy.lastTrackedId == "direct-1")
+        #expect(trackingServiceMock.trackInAppShownCallCount == 0)
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 0)
+    }
+
+    @Test("A non-unlimited show on request records like a trigger show", .tags(.inAppSchedule))
+    func showInAppNow_nonUnlimitedRecords() async {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let inapp = createInAppFormData(id: "direct-once", isPriority: false, delayTime: nil)
+
+        await showNowAndAwaitMainQueue(manager, inapp)
+        presentationManagerMock.receivedOnPresent?()
+
+        #expect(trackingServiceMock.trackInAppShownCallCount == 1)
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 1)
+
+        presentationManagerMock.receivedOnPresentationCompleted?(false)
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 2)
+    }
+
+    @Test("An unlimited trigger show records nothing", .tags(.inAppSchedule))
+    func presentInapp_unlimitedRecordsNothing() {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let inapp = createInAppFormData(id: "trigger-unlimited", isPriority: false, delayTime: nil, frequency: .unlimited)
+
+        manager.presentInapp(inapp, stopwatch: ForegroundStopwatch())
+        presentationManagerMock.receivedOnPresent?()
+        presentationManagerMock.receivedOnPresentationCompleted?(false)
+
+        #expect(trackerSpy.trackViewCallCount == 1)
+        #expect(trackingServiceMock.trackInAppShownCallCount == 0)
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 0)
+    }
+
+    @Test("A show on request sends the show and no targeting", .tags(.inAppSchedule))
+    func showInAppNow_sendsOnlyTheShow() async {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let inapp = createInAppFormData(id: "direct-2", isPriority: false, delayTime: nil)
+
+        await showNowAndAwaitMainQueue(manager, inapp)
+
+        presentationManagerMock.receivedOnPresent?()
+
+        #expect(trackerSpy.trackViewCallCount == 1)
+        #expect(trackerSpy.trackTargetingCallCount == 0)
+    }
+
+    @Test("A show on request counts the time since the tap into timeToDisplay", .tags(.inAppSchedule))
+    func showInAppNow_countsTheTapsProcessingTime() async throws {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let inapp = createInAppFormData(id: "direct-timed", isPriority: false, delayTime: nil)
+
+        await showNowAndAwaitMainQueue(manager, inapp, processingDuration: 3)
+        presentationManagerMock.receivedOnPresent?()
+
+        let timeToDisplay = try #require(trackerSpy.lastTimeToDisplay)
+        #expect(timeToDisplay.hasPrefix("00:00:03."), "expected at least the 3 s of processing, got \(timeToDisplay)")
+    }
+
+    @Test("A show on request goes on screen past the overlay already up", .tags(.inAppSchedule))
+    func showInAppNow_presentsPastTheActiveOverlay() async {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let active = createInAppFormData(id: "snackbar-on-screen", isPriority: false, delayTime: nil)
+        let story = createInAppFormData(id: "tapped-story", isPriority: false, delayTime: nil)
+
+        manager.presentInapp(active, stopwatch: ForegroundStopwatch())
+
+        await showNowAndAwaitMainQueue(manager, story)
+
+        #expect(presentationManagerMock.presentCallsCount == 2)
+        #expect(presentationManagerMock.receivedInAppUIModel?.inAppId == "tapped-story")
+    }
+
+    @Test("A trigger show still records the show, the event and the cooldown", .tags(.inAppSchedule))
+    func presentInapp_stillRecordsEverything() {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let inapp = createInAppFormData(id: "trigger-1", isPriority: false, delayTime: nil)
+
+        manager.presentInapp(inapp, stopwatch: ForegroundStopwatch())
+        presentationManagerMock.receivedOnPresent?()
+
+        #expect(trackerSpy.trackViewCallCount == 1)
+        #expect(trackerSpy.trackTargetingCallCount == 0)
+        #expect(trackingServiceMock.trackInAppShownCallCount == 1)
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 1)
+
+        presentationManagerMock.receivedOnPresentationCompleted?(false)
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 2)
+    }
+
+    @Test("A show on request answers success once the window is on screen", .tags(.inAppSchedule))
+    func showInAppNow_answersSuccessWhenPresented() async {
+        let manager = makeSpiedManager(tracker: InAppMessagesTrackerSpyMock())
+        let inapp = createInAppFormData(id: "direct-answered", isPriority: false, delayTime: nil)
+        var outcomes: [Result<Void, InappShowNowError>] = []
+
+        manager.showInAppNow(inapp, processingDuration: 0, proceedIf: { true }) { outcomes.append($0) }
+        await awaitMainQueue()
+        #expect(outcomes.isEmpty)
+
+        presentationManagerMock.receivedOnPresent?()
+
+        #expect(outcomes.count == 1)
+        if case .success = outcomes.first {} else {
+            Issue.record("Expected success, got \(String(describing: outcomes.first))")
+        }
+    }
+
+    @Test("A show on request answers the presentation error when the show failed", .tags(.inAppSchedule))
+    func showInAppNow_answersTheErrorWhenFailed() async {
+        let manager = makeSpiedManager(tracker: InAppMessagesTrackerSpyMock())
+        let inapp = createInAppFormData(id: "direct-failed", isPriority: false, delayTime: nil)
+        var outcomes: [Result<Void, InappShowNowError>] = []
+
+        manager.showInAppNow(inapp, processingDuration: 0, proceedIf: { true }) { outcomes.append($0) }
+        await awaitMainQueue()
+
+        presentationManagerMock.receivedOnError?(.failed("no window"))
+        presentationManagerMock.receivedOnError?(.failed("again"))
+
+        #expect(outcomes.count == 1)
+        if case .failure(.presentationFailed(.failed("no window"))) = outcomes.first {} else {
+            Issue.record("Expected the first presentation error, got \(String(describing: outcomes.first))")
+        }
+    }
+
+    @Test("A show on request whose window fails after it was on screen is answered once", .tags(.inAppSchedule))
+    func showInAppNow_errorAfterPresented_answersOnce() async {
+        let manager = makeSpiedManager(tracker: InAppMessagesTrackerSpyMock())
+        let inapp = createInAppFormData(id: "direct-late-error", isPriority: false, delayTime: nil)
+        var outcomes: [Result<Void, InappShowNowError>] = []
+
+        manager.showInAppNow(inapp, processingDuration: 0, proceedIf: { true }) { outcomes.append($0) }
+        await awaitMainQueue()
+
+        presentationManagerMock.receivedOnPresent?()
+        presentationManagerMock.receivedOnError?(.webviewPresentationFailed("bridge gone"))
+
+        #expect(outcomes.count == 1)
+        #expect(failureManagerMock.sentFailures.count == 1)
+    }
+
+    @Test("A window reporting itself on screen twice is one show and one answer", .tags(.inAppSchedule))
+    func showInAppNow_presentedTwice_isOneShow() async {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let inapp = createInAppFormData(id: "direct-twice", isPriority: false, delayTime: nil)
+        var outcomes: [Result<Void, InappShowNowError>] = []
+
+        manager.showInAppNow(inapp, processingDuration: 0, proceedIf: { true }) { outcomes.append($0) }
+        await awaitMainQueue()
+
+        presentationManagerMock.receivedOnPresent?()
+        presentationManagerMock.receivedOnPresent?()
+
+        #expect(outcomes.count == 1)
+        #expect(trackerSpy.trackViewCallCount == 1)
+        #expect(SessionTemporaryStorage.shared.sessionShownInApps == ["direct-twice"])
+    }
+
+    @Test("A show on request closed before it is on screen answers its request with an error", .tags(.inAppSchedule))
+    func showInAppNow_closedBeforePresented_answersWithAnError() async {
+        let manager = makeSpiedManager(tracker: InAppMessagesTrackerSpyMock())
+        let inapp = createInAppFormData(id: "direct-closed", isPriority: false, delayTime: nil)
+        var outcomes: [Result<Void, InappShowNowError>] = []
+
+        manager.showInAppNow(inapp, processingDuration: 0, proceedIf: { true }) { outcomes.append($0) }
+        await awaitMainQueue()
+
+        presentationManagerMock.receivedOnPresentationCompleted?(false)
+
+        #expect(outcomes.count == 1)
+        if case .failure = outcomes.first {} else {
+            Issue.record("Expected an error, got \(String(describing: outcomes.first))")
+        }
+        #expect(failureManagerMock.addFailureCallCount == 0)
+        #expect(failureManagerMock.sendFailuresCallCount == 0)
+        #expect(failureManagerMock.sentFailures.isEmpty)
+    }
+
+    @Test("A late error from a show replaced on request reports no failure", .tags(.inAppSchedule))
+    @MainActor
+    func showInAppNow_lateErrorFromTheReplacedShow_reportsNoFailure() async throws {
+        let display = PresentationDisplaySpy()
+        let delegate = DelegateSpy()
+        let manager = makeManagerOnRealPresentation(display, delegate: delegate)
+        manager.showInAppNow(createInAppFormData(id: "first", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) { _ in }
+        await awaitMainQueue()
+        let firstError = try #require(display.receivedOnError)
+
+        manager.showInAppNow(createInAppFormData(id: "second", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) { _ in }
+        await awaitMainQueue(turns: 2)
+        firstError(.webviewLoadFailed("late"))
+        await awaitMainQueue()
+
+        #expect(failureManagerMock.sentFailures.isEmpty)
+        #expect(display.onScreen == "second")
+        await closeWhatIsOnScreen(display)
+    }
+
+    @Test("A show on request that closes a loading show answers that show's request with an error", .tags(.inAppSchedule))
+    func showInAppNow_closingALoadingShow_answersItsRequest() async {
+        let manager = makeSpiedManager(tracker: InAppMessagesTrackerSpyMock())
+        var firstOutcomes: [Result<Void, InappShowNowError>] = []
+        manager.showInAppNow(createInAppFormData(id: "first", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) {
+            firstOutcomes.append($0)
+        }
+        await awaitMainQueue()
+        presentationManagerMock.hasActivePresentation = true
+
+        await showNowAndAwaitMainQueue(manager, createInAppFormData(id: "second", isPriority: false, delayTime: nil))
+
+        #expect(firstOutcomes.count == 1)
+        if case .failure = firstOutcomes.first {} else {
+            Issue.record("Expected the first request to be answered with an error, got \(String(describing: firstOutcomes.first))")
+        }
+    }
+
+    @Test("Two shows on request in one main turn: the first is answered with an error and reported closed to the host, the second shows",
+          .tags(.inAppSchedule))
+    @MainActor
+    func showInAppNow_twoInOneTurn_answersTheFirstAndShowsTheSecond() async {
+        let display = PresentationDisplaySpy()
+        let delegate = DelegateSpy()
+        let manager = makeManagerOnRealPresentation(display, delegate: delegate)
+        var firstOutcomes: [Result<Void, InappShowNowError>] = []
+        var secondOutcomes: [Result<Void, InappShowNowError>] = []
+
+        manager.showInAppNow(createInAppFormData(id: "first", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) {
+            firstOutcomes.append($0)
+        }
+        manager.showInAppNow(createInAppFormData(id: "second", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) {
+            secondOutcomes.append($0)
+        }
+        await awaitMainQueue(turns: 2)
+
+        #expect(display.dismissCount == 1)
+        #expect(display.onScreen == "second")
+        #expect(firstOutcomes.count == 1)
+        if case .failure = firstOutcomes.first {} else {
+            Issue.record("Expected the first request to be answered with an error, got \(String(describing: firstOutcomes.first))")
+        }
+        #expect(delegate.dismissedIds == ["first"])
+
+        display.receivedOnPresented?()
+
+        #expect(secondOutcomes.count == 1)
+        if case .success = secondOutcomes.first {} else {
+            Issue.record("Expected the second request to succeed, got \(String(describing: secondOutcomes.first))")
+        }
+        await closeWhatIsOnScreen(display)
+    }
+
+    @Test("A show on request reaches the screen in one main-queue pass", .tags(.inAppSchedule))
+    @MainActor
+    func showInAppNow_presentsInOneMainQueuePass() async {
+        let display = PresentationDisplaySpy()
+        let delegate = DelegateSpy()
+        let manager = makeManagerOnRealPresentation(display, delegate: delegate)
+
+        manager.showInAppNow(createInAppFormData(id: "story", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) { _ in }
+        let presentCountOnTheNextBlock = await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume(returning: display.presentCount) }
+        }
+
+        #expect(presentCountOnTheNextBlock == 1)
+        await closeWhatIsOnScreen(display)
+    }
+
+    @Test("A show on request whose requester is gone by the main-queue step leaves the in-app on screen and answers requesterGone",
+          .tags(.inAppSchedule))
+    @MainActor
+    func showInAppNow_requesterGoneByTheMainStep_leavesTheScreenAlone() async {
+        let display = PresentationDisplaySpy()
+        let delegate = DelegateSpy()
+        let manager = makeManagerOnRealPresentation(display, delegate: delegate)
+        manager.showInAppNow(createInAppFormData(id: "current", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) { _ in }
+        await awaitMainQueue()
+        display.receivedOnPresented?()
+        var isRequesterActive = true
+        var outcomes: [Result<Void, InappShowNowError>] = []
+
+        manager.showInAppNow(createInAppFormData(id: "next", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { isRequesterActive }) {
+            outcomes.append($0)
+        }
+        isRequesterActive = false
+        await awaitMainQueue()
+
+        #expect(display.onScreen == "current")
+        #expect(display.presentCount == 1)
+        #expect(display.dismissCount == 0)
+        #expect(delegate.dismissedIds.isEmpty)
+        #expect(failureManagerMock.sentFailures.isEmpty)
+        #expect(outcomes.count == 1)
+        if case .failure(.requesterGone) = outcomes.first {} else {
+            Issue.record("Expected requesterGone, got \(String(describing: outcomes.first))")
+        }
+        await closeWhatIsOnScreen(display)
+    }
+
+    @Test("A show on request in the background leaves the in-app on screen, reports no failure and answers appInBackground",
+          .tags(.inAppSchedule))
+    @MainActor
+    func showInAppNow_inTheBackground_leavesTheScreenAloneAndReportsNothing() async {
+        let display = PresentationDisplaySpy()
+        let delegate = DelegateSpy()
+        var isInBackground = false
+        let manager = makeManagerOnRealPresentation(display, delegate: delegate, isInBackground: { isInBackground })
+        manager.showInAppNow(createInAppFormData(id: "current", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) { _ in }
+        await awaitMainQueue()
+        display.receivedOnPresented?()
+        isInBackground = true
+        display.closesWhilePresenting = true
+        var outcomes: [Result<Void, InappShowNowError>] = []
+
+        manager.showInAppNow(createInAppFormData(id: "next", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) {
+            outcomes.append($0)
+        }
+        await awaitMainQueue()
+
+        #expect(display.onScreen == "current")
+        #expect(display.presentCount == 1)
+        #expect(delegate.dismissedIds.isEmpty)
+        #expect(failureManagerMock.sentFailures.isEmpty)
+        #expect(outcomes.count == 1)
+        if case .failure(.appInBackground) = outcomes.first {} else {
+            Issue.record("Expected appInBackground, got \(String(describing: outcomes.first))")
+        }
+        isInBackground = false
+        display.closesWhilePresenting = false
+        await closeWhatIsOnScreen(display)
+    }
+
+    @MainActor
+    private func closeWhatIsOnScreen(_ display: PresentationDisplaySpy) async {
+        display.receivedOnClose?()
+        await awaitMainQueue()
+    }
+
+    @MainActor
+    private func makeManagerOnRealPresentation(_ display: PresentationDisplaySpy,
+                                               delegate: InAppMessagesDelegate,
+                                               isInBackground: @escaping () -> Bool = { false }) -> InappScheduleManager {
+        let manager = InappScheduleManager(
+            presentationManager: InAppPresentationManager(displayUseCase: display),
+            budget: budget,
+            accountant: InappShowAccountant(tracker: InAppMessagesTrackerSpyMock(), budget: budget),
+            failureManager: failureManagerMock,
+            isInBackground: isInBackground
+        )
+        manager.delegate = delegate
+        return manager
+    }
+
+    @Test("A trigger show replaced by a show on request reports its close to the host and gives its slot back", .tags(.inAppSchedule))
+    @MainActor
+    func triggerShowReplacedByARequest_isReportedClosedAndGivesItsSlotBack() async throws {
+        let display = PresentationDisplaySpy()
+        let delegate = DelegateSpy()
+        let manager = makeManagerOnRealPresentation(display, delegate: delegate)
+        manager.scheduleInApp(createInAppFormData(id: "trigger", isPriority: false, delayTime: "00:00:02"), processingDuration: 0)
+        let presentationTime = try #require(manager.queue.sync { manager.inappsByPresentationTime.keys.first })
+        manager.showEligibleInapp(presentationTime)
+        manager.queue.sync {}
+        await awaitMainQueue()
+        #expect(display.onScreen == "trigger")
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations[.overlay("trigger")] != nil)
+
+        manager.showInAppNow(createInAppFormData(id: "story", isPriority: false, delayTime: nil), processingDuration: 0, proceedIf: { true }) { _ in }
+        await awaitMainQueue(turns: 2)
+
+        #expect(display.onScreen == "story")
+        #expect(delegate.dismissedIds == ["trigger"])
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations[.overlay("trigger")] == nil)
+        await closeWhatIsOnScreen(display)
+    }
+
+    @Test("A session reset discards the show on screen: no close reported to the host, no cooldown", .tags(.inAppSchedule))
+    @MainActor
+    func sessionResetDiscardsTheShow_reportsNothingAndWritesNoCooldown() async {
+        let display = PresentationDisplaySpy()
+        let delegate = DelegateSpy()
+        let manager = makeManagerOnRealPresentation(display, delegate: delegate)
+        manager.presentInapp(createInAppFormData(id: "on-screen", isPriority: false, delayTime: nil), stopwatch: ForegroundStopwatch())
+        display.receivedOnPresented?()
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 1)
+
+        NotificationCenter.default.post(name: .shouldDiscardInapps, object: nil)
+        await awaitMainQueue(turns: 2)
+
+        #expect(display.onScreen == nil)
+        #expect(delegate.dismissedIds.isEmpty)
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 1)
+    }
+
+    @Test("A show on request reports a presentation error", .tags(.inAppSchedule))
+    func showInAppNow_reportsAnError() async {
+        let trackerSpy = InAppMessagesTrackerSpyMock()
+        let manager = makeSpiedManager(tracker: trackerSpy)
+        let inapp = createInAppFormData(id: "direct-err", isPriority: false, delayTime: nil)
+
+        await showNowAndAwaitMainQueue(manager, inapp)
+        presentationManagerMock.receivedOnError?(.failed("no window"))
+
+        #expect(failureManagerMock.sentFailures.count == 1)
+        #expect(failureManagerMock.sendFailuresCallCount == 0)
+    }
+
+    // MARK: - The show budget
+
+    private func showScheduled(_ inapp: InAppFormData) async {
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+        scheduleManager.queue.sync {
+            presentationTime = self.scheduleManager.inappsByPresentationTime.keys.first
+        }
+        if let presentationTime {
+            scheduleManager.showEligibleInapp(presentationTime)
+        }
+        await awaitSchedule()
+    }
+
+    @Test("A scheduled in-app past the session limit is not presented", .tags(.inAppSchedule))
+    func showEligibleInapp_pastSessionLimit_isNotPresented() async {
+        SessionTemporaryStorage.shared.inAppSettings = Settings.InAppSettings(maxInappsPerSession: 1, maxInappsPerDay: nil, minIntervalBetweenShows: nil)
+        SessionTemporaryStorage.shared.sessionShownInApps = ["already-shown"]
+
+        await showScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        #expect(presentationManagerMock.presentCallsCount == 0)
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations.isEmpty)
+    }
+
+    @Test("A presented in-app holds its slot until the window reports itself", .tags(.inAppSchedule))
+    func showEligibleInapp_holdsTheSlotUntilPresented() async {
+        await showScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        #expect(presentationManagerMock.presentCallsCount == 1)
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations[.overlay("1")]?.inAppId == "1")
+
+        presentationManagerMock.receivedOnPresent?()
+
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations.isEmpty)
+        #expect(SessionTemporaryStorage.shared.sessionShownInApps == ["1"])
+    }
+
+    @Test("A presentation error gives the slot back", .tags(.inAppSchedule))
+    func showEligibleInapp_errorGivesTheSlotBack() async {
+        await showScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        presentationManagerMock.receivedOnError?(.failed("no window"))
+
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations.isEmpty)
+        #expect(SessionTemporaryStorage.shared.sessionShownInApps.isEmpty)
+    }
+
+    @Test("A show closed before it is on screen gives the slot back and spends nothing", .tags(.inAppSchedule))
+    func showEligibleInapp_closedBeforePresented_givesTheSlotBack() async {
+        await showScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        presentationManagerMock.receivedOnPresentationCompleted?(false)
+
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations.isEmpty)
+        #expect(SessionTemporaryStorage.shared.sessionShownInApps.isEmpty)
+        #expect(trackingServiceMock.saveInappStateChangeCallCount == 0)
+    }
+
+    @Test("A show on request that closes a loading show gives that show's slot back", .tags(.inAppSchedule))
+    func showInAppNow_closingALoadingShow_givesItsSlotBack() async {
+        await showScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations[.overlay("1")] != nil)
+
+        await showNowAndAwaitMainQueue(scheduleManager, createInAppFormData(id: "2", isPriority: false, delayTime: nil))
+        presentationManagerMock.receivedOnPresent?()
+
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations.isEmpty)
+        #expect(SessionTemporaryStorage.shared.sessionShownInApps == ["2"])
+    }
+
+    @Test("Another in-app on screen blocks the show without taking a slot", .tags(.inAppSchedule))
+    func showEligibleInapp_whileAnotherIsOnScreen_isNotPresented() async {
+        presentationManagerMock.hasActivePresentation = true
+
+        await showScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        #expect(presentationManagerMock.presentCallsCount == 0)
+        #expect(SessionTemporaryStorage.shared.ledger.showBudget.reservations.isEmpty)
+    }
+
+    @Test("A scheduled show is decided and presented on the main queue", .tags(.inAppSchedule))
+    func showEligibleInapp_presentsOnTheMainQueue() async {
+        await showScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        #expect(presentationManagerMock.presentedOnMainThread == true)
+    }
+
+    // MARK: - A slot taken in the background
+
+    private var reservations: [InappShowBudgetOwner: InappShowReservation] {
+        SessionTemporaryStorage.shared.ledger.showBudget.reservations
+    }
+
+    private var scheduledCount: Int {
+        var count = 0
+        scheduleManager.queue.sync { count = self.scheduleManager.inappsByPresentationTime.count }
+        return count
+    }
+
+    private func holdScheduled(_ inapp: InAppFormData) {
+        scheduleManager.scheduleInApp(inapp, processingDuration: 0)
+
+        var presentationTime: TimeInterval?
+        scheduleManager.queue.sync {
+            presentationTime = self.scheduleManager.inappsByPresentationTime.keys.max()
+        }
+        if let presentationTime {
+            scheduleManager.holdEligibleInapp(presentationTime)
+        }
+        scheduleManager.queue.sync {}
+    }
+
+    private func comeToForeground(after seconds: TimeInterval = 5) async {
+        SessionTemporaryStorage.shared.isInitializationCalled = true
+        host.clockOffset += seconds
+        scheduleManager.checkExpiredInapps()
+        await awaitSchedule()
+    }
+
+    private func awaitHold(of inAppId: String) async {
+        for _ in 0..<40 where reservations[.overlay(inAppId)] == nil {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        scheduleManager.queue.sync {}
+    }
+
+    @Test("A timer firing in the background holds the in-app instead of presenting it", .tags(.inAppSchedule))
+    func timer_inBackground_holdsInsteadOfPresenting() async {
+        host.isInBackground = true
+
+        scheduleManager.scheduleInApp(createInAppFormData(id: "1", isPriority: false, delayTime: nil), processingDuration: 0)
+        await awaitHold(of: "1")
+
+        #expect(presentationManagerMock.presentCallsCount == 0)
+        #expect(reservations[.overlay("1")]?.inAppId == "1")
+        #expect(scheduledCount == 1)
+    }
+
+    @Test("An in-app whose moment comes in the background takes its slot and waits", .tags(.inAppSchedule))
+    func hold_takesTheSlotAndWaits() {
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        #expect(presentationManagerMock.presentCallsCount == 0)
+        #expect(reservations[.overlay("1")]?.inAppId == "1")
+        #expect(scheduledCount == 1)
+    }
+
+    @Test("A held in-app is presented at the foreground and spends its slot once on screen", .tags(.inAppSchedule))
+    func hold_isPresentedAtTheForeground() async {
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        await comeToForeground()
+
+        #expect(presentationManagerMock.presentCallsCount == 1)
+        #expect(presentationManagerMock.receivedInAppUIModel?.inAppId == "1")
+        #expect(reservations[.overlay("1")] != nil)
+        #expect(scheduledCount == 0)
+
+        presentationManagerMock.receivedOnPresent?()
+
+        #expect(reservations.isEmpty)
+        #expect(SessionTemporaryStorage.shared.sessionShownInApps == ["1"])
+    }
+
+    @Test("A block resolving while a held in-app waits finds the slot taken", .tags(.inAppSchedule))
+    func hold_keepsTheSlotFromABlock() {
+        SessionTemporaryStorage.shared.inAppSettings = Settings.InAppSettings(maxInappsPerSession: 1, maxInappsPerDay: nil, minIntervalBetweenShows: nil)
+
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        let block = budget.reserve(.place("stories"), inAppId: "2", isPriority: false, frequency: .once(OnceFrequency(kind: .session)))
+        #expect(block == .refused)
+    }
+
+    @Test("An in-app refused its slot in the background is dropped, not retried at the foreground", .tags(.inAppSchedule))
+    func hold_refused_isDropped() async {
+        SessionTemporaryStorage.shared.inAppSettings = Settings.InAppSettings(maxInappsPerSession: 1, maxInappsPerDay: nil, minIntervalBetweenShows: nil)
+        SessionTemporaryStorage.shared.sessionShownInApps = ["already-shown"]
+
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+        #expect(reservations.isEmpty)
+        #expect(scheduledCount == 0)
+
+        SessionTemporaryStorage.shared.sessionShownInApps = []
+        await comeToForeground()
+
+        #expect(presentationManagerMock.presentCallsCount == 0)
+    }
+
+    @Test("A held in-app finding another on screen at the foreground gives its slot back", .tags(.inAppSchedule))
+    func hold_blockedAtTheForeground_givesTheSlotBack() async {
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+        presentationManagerMock.hasActivePresentation = true
+
+        await comeToForeground()
+
+        #expect(presentationManagerMock.presentCallsCount == 0)
+        #expect(reservations.isEmpty)
+        #expect(scheduledCount == 0)
+    }
+
+    @Test("Of several held in-apps the earliest is presented and the others give their slots back", .tags(.inAppSchedule))
+    func hold_several_onlyTheEarliestIsPresented() async {
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+        holdScheduled(createInAppFormData(id: "2", isPriority: false, delayTime: "00:00:03"))
+        #expect(reservations.count == 2)
+
+        await comeToForeground()
+
+        #expect(presentationManagerMock.presentCallsCount == 1)
+        #expect(presentationManagerMock.receivedInAppUIModel?.inAppId == "1")
+        #expect(Array(reservations.keys) == [.overlay("1")])
+        #expect(scheduledCount == 0)
+    }
+
+    @Test("A held in-app closed before it is on screen gives the slot back", .tags(.inAppSchedule))
+    func hold_closedBeforePresented_givesTheSlotBack() async {
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+        await comeToForeground()
+
+        presentationManagerMock.receivedOnPresentationCompleted?(false)
+
+        #expect(reservations.isEmpty)
+        #expect(SessionTemporaryStorage.shared.sessionShownInApps.isEmpty)
+    }
+
+    @Test("A session expired while in-apps were held gives every slot back", .tags(.inAppSchedule))
+    func hold_sessionExpired_givesEverySlotBack() async {
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+        holdScheduled(createInAppFormData(id: "2", isPriority: false, delayTime: "00:00:03"))
+        SessionTemporaryStorage.shared.configSessionExpirationTime = host.now
+
+        await comeToForeground()
+
+        #expect(presentationManagerMock.presentCallsCount == 0)
+        #expect(reservations.isEmpty)
+        #expect(scheduledCount == 0)
+    }
+
+    @Test("A show on request closed before it is on screen leaves a held slot of the same in-app alone", .tags(.inAppSchedule))
+    func showInAppNow_closedBeforePresented_leavesAHeldSlotAlone() async {
+        holdScheduled(createInAppFormData(id: "1", isPriority: false, delayTime: "00:00:02"))
+
+        await showNowAndAwaitMainQueue(scheduleManager, createInAppFormData(id: "1", isPriority: false, delayTime: nil))
+        presentationManagerMock.receivedOnPresentationCompleted?(false)
+
+        #expect(reservations[.overlay("1")]?.inAppId == "1")
+    }
+
+    // MARK: - Helpers
+
+    private func createInAppFormData(id: String,
+                                     isPriority: Bool,
+                                     delayTime: String?,
+                                     frequency: InappFrequency = .once(OnceFrequency(kind: .session)),
+                                     tags: [String: String]? = nil) -> InAppFormData {
+        let modalVariant = ModalFormVariant(content: createMockContent())
+        let content: MindboxFormVariant = .modal(modalVariant)
+
+        return InAppFormData(
+            inAppId: id,
+            isPriority: isPriority,
+            delayTime: delayTime,
+            imagesDict: [:],
+            firstImageValue: "",
+            content: content,
+            frequency: frequency,
+            tags: tags
+        )
+    }
+
+    private func createMockContent() -> InappFormVariantContent {
+        let background = ContentBackground(layers: [])
+        return InappFormVariantContent(background: background, elements: nil)
+    }
+}
+
+class InAppTrackingServiceMock: InAppTrackingServiceProtocol {
+    var trackInAppShownCallCount = 0
+    var saveInappStateChangeCallCount = 0
+    var lastTrackedInAppId: String?
+    
+    func trackInAppShown(id: String, in history: inout InappShowHistory) {
+        trackInAppShownCallCount += 1
+        lastTrackedInAppId = id
+    }
+    
+    func saveInappStateChange(in history: inout InappShowHistory) {
+        saveInappStateChangeCallCount += 1
+    }
+}
+
+final class InappShowFailureManagerMock: InappShowFailureManagerProtocol {
+    struct AddFailureCall {
+        let inappId: String
+        let reason: InAppShowFailureReason
+        let details: String?
+        let tags: [String: String]?
+    }
+
+    @Locked private(set) var addFailureCallCount = 0
+    @Locked private(set) var sendFailuresCallCount = 0
+    @Locked private(set) var clearFailuresCallCount = 0
+    @Locked private(set) var waitBudgetExceeded: [(place: String, waited: TimeInterval, phase: EmbeddedBlockShowFailure.Phase)] = []
+    @Locked private(set) var addFailureCalls: [AddFailureCall] = []
+    @Locked private(set) var sentAtOnce: [AddFailureCall] = []
+    @Locked private(set) var sentFailures: [AddFailureCall] = []
+
+    func addFailure(inappId: String, reason: InAppShowFailureReason, details: String?, tags: [String: String]?) {
+        addFailureCallCount += 1
+        addFailureCalls.append(AddFailureCall(inappId: inappId, reason: reason, details: details, tags: tags))
+    }
+
+    func sendBlockFailure(inappId: String, reason: InAppShowFailureReason, details: String?, tags: [String: String]?) {
+        sentAtOnce.append(AddFailureCall(inappId: inappId, reason: reason, details: details, tags: tags))
+    }
+
+    func sendFailure(inappId: String, reason: InAppShowFailureReason, details: String?, tags: [String: String]?) {
+        sentFailures.append(AddFailureCall(inappId: inappId, reason: reason, details: details, tags: tags))
+    }
+
+    func sendFailures() {
+        sendFailuresCallCount += 1
+    }
+
+    func clearFailures() {
+        clearFailuresCallCount += 1
+    }
+
+    func sendWaitBudgetExceeded(place: String, waited: TimeInterval, phase: EmbeddedBlockShowFailure.Phase) {
+        waitBudgetExceeded.append((place, waited, phase))
+    }
+}

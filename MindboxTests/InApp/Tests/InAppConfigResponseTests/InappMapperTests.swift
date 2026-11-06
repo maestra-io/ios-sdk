@@ -1,0 +1,676 @@
+//
+//  InappRemainingTargetingTests.swift
+//  MindboxTests
+//
+//  Created by vailence on 14.11.2024.
+//  Updated to Swift Testing by Serge & ChatGPT
+//
+
+import Testing
+import Foundation
+import class MindboxLogger.Locked
+@_spi(Internal) @testable import Mindbox
+
+fileprivate enum InappTargetingConfig: String, Configurable {
+    typealias DecodeType = ConfigResponse
+
+    case oneTargeting                  = "1-Targeting"
+    case threeFourFiveRequests         = "3-4-5-TargetingRequests"
+    case sevenRequests                 = "7-TargetingRequests"
+    case eightRequests                 = "8-TargetingRequests"
+    case nineRequests                  = "9-TargetingRequests"
+    case fourteenRequests              = "14-TargetingRequests"
+    case fifteenTargeting              = "15-Targeting"
+    case sixteenSeventeenRequests      = "16-17-TargetingRequests"
+    case twentySevenRequests           = "27-TargetingRequests"
+    case thirtyOneRequests             = "31-TargetingRequests"
+    case fortyFourTargeting            = "44-Targeting"
+    case fortyFiveTargeting            = "45-Targeting"
+    case fortySixTargeting             = "46-Targeting"
+    case tagsFailedTargeting           = "Tags-FailedTargeting"
+}
+
+// MARK: - Suite
+
+@Suite("In-app remaining targeting tests")
+struct InappRemainingTargetingTests {
+
+    private var targetingChecker: InAppTargetingCheckerProtocol
+    private var mockDataFacade: MockInAppConfigurationDataFacade
+    private var mapper: InappMapperProtocol
+    private var requestedInappBuilder: RequestedInappBuilder
+    private var persistenceStorage: PersistenceStorage
+
+    init() {
+        TestConfiguration.configure()
+
+        SessionTemporaryStorage.shared.erase()
+
+        self.targetingChecker = DI.injectOrFail(InAppTargetingCheckerProtocol.self)
+
+        let databaseRepository = DI.injectOrFail(DatabaseRepositoryProtocol.self)
+        try? databaseRepository.erase()
+
+        let facade = DI.injectOrFail(InAppConfigurationDataFacadeProtocol.self)
+        guard let mock = facade as? MockInAppConfigurationDataFacade else {
+            fatalError("Expected MockInAppConfigurationDataFacade from DI. Check test DI configuration.")
+        }
+        self.mockDataFacade = mock
+        self.mockDataFacade.cleanTargetingArray()
+        self.mockDataFacade.cleanImageDownloadFailures()
+        self.mockDataFacade.cleanCollectedTargetingFailureIds()
+
+        self.mapper = DI.injectOrFail(InappMapperProtocol.self)
+        self.requestedInappBuilder = RequestedInappBuilder(inappFilterService: DI.injectOrFail(InappFilterProtocol.self),
+                                                           dataFacade: mock)
+        self.persistenceStorage = DI.injectOrFail(PersistenceStorage.self)
+        self.persistenceStorage.shownDatesByInApp = [:]
+    }
+
+    // MARK: - Helpers
+
+    @discardableResult
+    private func handleInapps(
+        event: ApplicationEvent?,
+        config: ConfigResponse
+    ) async -> InAppFormData? {
+        await withCheckedContinuation { continuation in
+            mapper.handleInapps(event, config.candidates) { formData in
+                continuation.resume(returning: formData)
+            }
+        }
+    }
+
+    private func passParkedAtItsImage(
+        event: ApplicationEvent?,
+        config: ConfigResponse,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async throws -> Locked<[String?]> {
+        let passAnswers = Locked<[String?]>(wrappedValue: [])
+        mockDataFacade.holdsNextImageDownload = true
+
+        mapper.handleInapps(event, config.candidates) { formData in
+            passAnswers.mutate { $0.append(formData?.inAppId) }
+        }
+        let parked = await pollUntil(deadline: 5, value: { mockDataFacade.holdsAnImageDownload }, condition: { $0 })
+        try #require(parked, "the pass never reached its image download", sourceLocation: sourceLocation)
+        return passAnswers
+    }
+
+    private func releaseParkedPass(_ passAnswers: Locked<[String?]>) async -> [String?] {
+        mockDataFacade.releaseHeldImageDownload()
+        return await pollUntil(deadline: 5, value: { passAnswers.wrappedValue }, condition: { !$0.isEmpty })
+    }
+
+    private func pageAnswers(asking ids: [String], config: ConfigResponse) async -> [[String]] {
+        let answers = Locked<[[String]]>(wrappedValue: [])
+        mapper.getShowableInappIds(ids, askedBy: "a-block", config.candidates) { answer in
+            answers.mutate { $0.append(answer) }
+        }
+        return await pollUntil(deadline: 2, value: { answers.wrappedValue }, condition: { !$0.isEmpty })
+    }
+
+    private func assertTargetingShows(id: String) {
+        #expect(
+            mockDataFacade.showArray.contains(id),
+            "ID \(id) is expected to be shown"
+        )
+    }
+
+    private func assertTargetingEquals(ids: [String]) {
+        #expect(
+            Set(mockDataFacade.targetingArray) == Set(ids),
+            "Targeting array does not match the expected IDs. Expected: \(ids), actual: \(mockDataFacade.targetingArray)"
+        )
+    }
+
+    private func waitForTargetingArray(
+        expectedCount: Int,
+        timeout: TimeInterval = 5
+    ) async {
+        let final = await pollUntil(deadline: timeout, pollInterval: 0.05,
+                                    value: { mockDataFacade.targetingArray },
+                                    condition: { $0.count >= expectedCount })
+        if final.count < expectedCount {
+            Issue.record("Timed out waiting for targetingArray to reach count \(expectedCount). Current: \(final)")
+        }
+    }
+
+    // MARK: - Tests
+
+    @Test("True in-app, not shown before → should be shown", .tags(.remainingTargeting))
+    func inappTrue_notShownBefore() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1"])
+    }
+
+    @Test("Two true in-apps, none shown before", .tags(.remainingTargeting))
+    func twoInappsTrue_notShownBefore() async throws {
+        let config = try InappTargetingConfig.threeFourFiveRequests.getConfig()
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1", "2"])
+    }
+
+    @Test("Two true in-apps, first already shown", .tags(.remainingTargeting))
+    func twoInappsTrue_firstShownBefore() async throws {
+        let config = try InappTargetingConfig.threeFourFiveRequests.getConfig()
+        persistenceStorage.shownDatesByInApp = ["1": [Date()]]
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "2")
+        assertTargetingEquals(ids: ["2", "1"])
+    }
+
+    @Test("Two true in-apps, both already shown", .tags(.remainingTargeting))
+    func twoInappsTrue_bothAlreadyShown() async throws {
+        let config = try InappTargetingConfig.threeFourFiveRequests.getConfig()
+        persistenceStorage.shownDatesByInApp = [
+            "1": [Date()],
+            "2": [Date()]
+        ]
+
+        await handleInapps(event: nil, config: config)
+
+        assertTargetingEquals(ids: ["1", "2"])
+    }
+    
+    @Test("Failed targeting collects tags only for failed in-apps that have them", .tags(.remainingTargeting, .inAppTags))
+    func failedTargeting_collectsTagsOnlyForFailedInappsWithTags() async throws {
+        let config = try InappTargetingConfig.tagsFailedTargeting.getConfig()
+
+        await handleInapps(event: nil, config: config)
+
+        #expect(mockDataFacade.collectedTargetingFailureIds == [Set(["1", "3"])])
+        #expect(mockDataFacade.collectedTagsByInappId == [
+            ["1": ["templateType": "Popup", "abTestVariant": "control"]]
+        ])
+    }
+
+    @Test("A pass that found a winner drops the failures of the in-apps it cut — something was shown", .tags(.remainingTargeting))
+    func passWithWinner_dropsTheCutInappsFailures() async throws {
+        let config = try InappTargetingConfig.tagsFailedTargeting.getConfig()
+
+        await handleInapps(event: nil, config: config)
+
+        assertTargetingShows(id: "2")
+        #expect(mockDataFacade.collectedTargetingFailureIds == [Set(["1", "3"])])
+        #expect(mockDataFacade.discardCollectedFailuresCalls == 1)
+        #expect(mockDataFacade.sendCollectedFailuresCalls == 0)
+    }
+
+    @Test("A pass that found nothing to show sends the failures it collected", .tags(.remainingTargeting))
+    func passWithoutWinner_sendsTheCollectedFailures() async throws {
+        let config = try InappTargetingConfig.tagsFailedTargeting.getConfig()
+
+        await handleInapps(event: ApplicationEvent(name: "nobody.listens", model: nil), config: config)
+
+        #expect(mockDataFacade.sendCollectedFailuresCalls == 1)
+        #expect(mockDataFacade.discardCollectedFailuresCalls == 0)
+    }
+
+    @Test("A place resolve waits for the trigger pass ahead of it to finish before it swaps the event or fetches",
+          .tags(.remainingTargeting))
+    func placeResolve_waitsForTheTriggerPassAheadOfIt() async throws {
+        let config = try InappTargetingConfig.tagsFailedTargeting.getConfig()
+        let triggerEvent = ApplicationEvent(name: "nobody.listens", model: nil)
+        let placeTrigger = ApplicationEvent(name: "block.refresh", model: nil)
+        let triggerAnswers = Locked<[String?]>(wrappedValue: [])
+        let placeAnswers = Locked<[EmbeddedPlaceSelection]>(wrappedValue: [])
+        func expectThePlaceStillWaits(fetchesSoFar: Int, _ moment: String) async throws {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            #expect(mockDataFacade.fetchDependenciesCalls == fetchesSoFar, "the place resolve fetched \(moment)")
+            #expect(targetingChecker.event?.name == triggerEvent.name, "the place resolve swapped the event \(moment)")
+        }
+        mockDataFacade.holdsFetches = true
+
+        mapper.handleInapps(triggerEvent, config.candidates) { formData in
+            triggerAnswers.mutate { $0.append(formData?.inAppId) }
+        }
+        let held = await pollUntil(deadline: 5, value: { mockDataFacade.heldFetchCount }, condition: { $0 == 1 })
+        try #require(held == 1, "the trigger pass never reached its fetch")
+
+        mapper.selectInappForPlace("place-nobody-addresses", trigger: placeTrigger, config.candidates) { selection in
+            placeAnswers.mutate { $0.append(selection) }
+        }
+        try await expectThePlaceStillWaits(fetchesSoFar: 1, "while the trigger pass waited for its selection")
+
+        mockDataFacade.releaseOldestHeldFetch()
+        let fetches = await pollUntil(deadline: 5, value: { mockDataFacade.fetchDependenciesCalls }, condition: { $0 >= 2 })
+        try #require(fetches >= 2, "the trigger pass never reached its catch-up")
+        try await expectThePlaceStillWaits(fetchesSoFar: 2, "between the trigger pass's selection and its catch-up")
+
+        mockDataFacade.releaseHeldFetches()
+
+        let answered = await pollUntil(deadline: 5,
+                                       value: { (trigger: triggerAnswers.wrappedValue, place: placeAnswers.wrappedValue) },
+                                       condition: { $0.trigger.count == 1 && $0.place.count == 1 })
+        #expect(answered.trigger == [nil])
+        #expect(answered.place == [.decided(nil)])
+        #expect(mockDataFacade.fetchDependenciesCalls == 3)
+        #expect(targetingChecker.event?.name == placeTrigger.name)
+    }
+
+    @Test("A page is answered while the start pass waits for its in-app's image", .tags(.remainingTargeting))
+    func page_isAnsweredWhileTheStartPassWaitsForAnImage() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        let passAnswers = try await passParkedAtItsImage(event: nil, config: config)
+
+        let answered = await pageAnswers(asking: ["1"], config: config)
+        #expect(answered == [["1"]])
+        #expect(passAnswers.wrappedValue.isEmpty)
+
+        let finished = await releaseParkedPass(passAnswers)
+        #expect(finished == ["1"])
+    }
+
+    @Test("A page answered inside a pass's image wait leaves the pass's failures to the pass", .tags(.remainingTargeting))
+    func pageInsideAnImageWait_leavesThePassFailuresToThePass() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        let passAnswers = try await passParkedAtItsImage(event: nil, config: config)
+
+        let answered = await pageAnswers(asking: ["1"], config: config)
+        try #require(answered.count == 1, "the page was not answered inside the image wait")
+        #expect(mockDataFacade.sendCollectedFailuresCalls == 0)
+        #expect(mockDataFacade.discardCollectedFailuresCalls == 0)
+
+        _ = await releaseParkedPass(passAnswers)
+        #expect(mockDataFacade.discardCollectedFailuresCalls == 1)
+        #expect(mockDataFacade.sendCollectedFailuresCalls == 0)
+    }
+
+    @Test("A page's question neither sends nor drops the failures a pass collects", .tags(.remainingTargeting))
+    func pageQuestion_leavesTheCollectedFailuresAlone() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+
+        let answer = await withCheckedContinuation { continuation in
+            mapper.getShowableInappIds(["1"], askedBy: "a-block", config.candidates) { continuation.resume(returning: $0) }
+        }
+
+        #expect(answer == ["1"])
+        #expect(mockDataFacade.sendCollectedFailuresCalls == 0)
+        #expect(mockDataFacade.discardCollectedFailuresCalls == 0)
+    }
+
+    @Test("An operation pass's catch-up after a page's question still checks against the pass's operation",
+          .tags(.remainingTargeting, .geoTargeting))
+    func operationCatchUp_afterAPageQuestion_checksThePassOperation() async throws {
+        let config = try InappTargetingConfig.fortyFourTargeting.getConfig()
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+        await handleInapps(event: nil, config: config)
+        mockDataFacade.cleanTargetingArray()
+
+        let passAnswers = try await passParkedAtItsImage(event: ApplicationEvent(name: "test", model: nil), config: config)
+
+        let answered = await pageAnswers(asking: ["4"], config: config)
+        try #require(answered == [[]], "the page was not answered inside the image wait")
+
+        _ = await releaseParkedPass(passAnswers)
+        assertTargetingEquals(ids: ["1", "2", "3"])
+    }
+
+    @Test("A place resolve still waits for a trigger pass that loads its in-app's image", .tags(.remainingTargeting))
+    func placeResolve_waitsForATriggerPassInItsImageWait() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        let passAnswers = try await passParkedAtItsImage(event: nil, config: config)
+        let placeAnswers = Locked<[EmbeddedPlaceSelection]>(wrappedValue: [])
+
+        mapper.selectInappForPlace("place-nobody-addresses", trigger: nil, config.candidates) { selection in
+            placeAnswers.mutate { $0.append(selection) }
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        #expect(placeAnswers.wrappedValue.isEmpty, "the place resolve overtook the trigger pass")
+
+        mockDataFacade.releaseHeldImageDownload()
+        let answered = await pollUntil(deadline: 5,
+                                       value: { (pass: passAnswers.wrappedValue, place: placeAnswers.wrappedValue) },
+                                       condition: { $0.pass.count == 1 && $0.place.count == 1 })
+        #expect(answered.pass == ["1"])
+        #expect(answered.place == [.decided(nil)])
+    }
+
+    @Test("Shown in-app propagates its tags into trackTargeting and downloadImage", .tags(.remainingTargeting, .inAppTags))
+    func shownInapp_propagatesTagsToTrackTargetingAndDownloadImage() async throws {
+        let config = try InappTargetingConfig.tagsFailedTargeting.getConfig()
+
+        await handleInapps(event: nil, config: config)
+
+        assertTargetingShows(id: "2")
+        let trackedTags = mockDataFacade.trackTargetingCalls.first(where: { $0.id == "2" })?.tags
+        #expect(trackedTags == ["templateType": "Snackbar"])
+        #expect(mockDataFacade.downloadImageTags["2"] == ["templateType": "Snackbar"])
+    }
+
+    @Test("Image download error adds in-app show failure", .tags(.remainingTargeting))
+    func imageDownloadError_addsFailure() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        let imageError = MindboxError.serverError(
+            .init(
+                status: .internalServerError,
+                errorMessage: "image download failed",
+                httpStatusCode: 500
+            )
+        )
+        mockDataFacade.downloadImageError = imageError
+        mockDataFacade.cleanImageDownloadFailures()
+        
+        _ = await handleInapps(event: nil, config: config)
+        
+        #expect(mockDataFacade.imageDownloadFailures.count == 1)
+        #expect(mockDataFacade.imageDownloadFailures.first?.inappId == "1")
+        #expect(mockDataFacade.imageDownloadFailures.first?.report == .bufferedForThePass)
+        let details = mockDataFacade.imageDownloadFailures.first?.details ?? ""
+        #expect(details.hasPrefix("Image URL:"))
+        #expect(details.contains(imageError.localizedDescription))
+    }
+    
+    @Test("Image download 4xx error adds in-app show failure", .tags(.remainingTargeting))
+    func imageDownload4xxError_addsFailure() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        let imageError = MindboxError.protocolError(
+            .init(
+                status: .protocolError,
+                errorMessage: "not found",
+                httpStatusCode: 404
+            )
+        )
+        mockDataFacade.downloadImageError = imageError
+        mockDataFacade.cleanImageDownloadFailures()
+        
+        _ = await handleInapps(event: nil, config: config)
+        
+        #expect(mockDataFacade.imageDownloadFailures.count == 1)
+        #expect(mockDataFacade.imageDownloadFailures.first?.inappId == "1")
+    }
+
+    @Test("Image download connection error does not add in-app show failure", .tags(.remainingTargeting))
+    func imageDownloadConnectionError_doesNotAddFailure() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        let imageError = MindboxError.connectionError
+        mockDataFacade.downloadImageError = imageError
+        mockDataFacade.cleanImageDownloadFailures()
+        
+        _ = await handleInapps(event: nil, config: config)
+        
+        #expect(mockDataFacade.imageDownloadFailures.isEmpty)
+    }
+
+    @Test("A tap whose image fails to download reports the failure at once, past the passes' buffer", .tags(.remainingTargeting))
+    func tapImageDownloadError_sendsTheFailureAtOnce() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        mockDataFacade.downloadImageError = MindboxError.serverError(
+            .init(status: .internalServerError, errorMessage: "image download failed", httpStatusCode: 500)
+        )
+
+        let formData = await withCheckedContinuation { continuation in
+            requestedInappBuilder.build("1", params: [:], from: config.candidates) { continuation.resume(returning: $0) }
+        }
+
+        #expect(formData == nil)
+        #expect(mockDataFacade.imageDownloadFailures.map(\.report) == [.atOnce])
+        #expect(mockDataFacade.sendCollectedFailuresCalls == 0)
+        #expect(mockDataFacade.discardCollectedFailuresCalls == 0)
+    }
+
+    @Test("Taps are answered in the order they came, even when an earlier one still waits for its image", .tags(.remainingTargeting))
+    func taps_areAnsweredInTheOrderTheyCame() async throws {
+        let config = try InappTargetingConfig.oneTargeting.getConfig()
+        let answered = Locked<[JSONValue?]>(wrappedValue: [])
+        let record: (InAppFormData?) -> Void = { formData in
+            answered.mutate { $0.append(formData?.extraParams?["tap"]) }
+        }
+        mockDataFacade.holdsNextImageDownload = true
+
+        requestedInappBuilder.build("1", params: ["tap": .string("first")], from: config.candidates, record)
+        let parked = await pollUntil(deadline: 5, value: { mockDataFacade.holdsAnImageDownload }, condition: { $0 })
+        try #require(parked, "the first tap's image download never started")
+
+        requestedInappBuilder.build("1", params: ["tap": .string("second")], from: config.candidates, record)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        mockDataFacade.releaseHeldImageDownload()
+
+        let order = await pollUntil(deadline: 5, value: { answered.wrappedValue }, condition: { $0.count == 2 })
+        #expect(order == [.string("first"), .string("second")])
+    }
+
+    @Test("Single geo in-app, not shown before", .tags(.remainingTargeting, .geoTargeting))
+    func oneInappGeo_notShownBefore() async throws {
+        let config = try InappTargetingConfig.sevenRequests.getConfig()
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1"])
+    }
+
+    @Test("One true + one geo in-app, none shown before", .tags(.remainingTargeting, .geoTargeting))
+    func oneTrue_oneGeo_notShownBefore() async throws {
+        let config = try InappTargetingConfig.eightRequests.getConfig()
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1", "2"])
+    }
+
+    @Test("True shown, operation and geo+segment in-app", .tags(.remainingTargeting, .geoTargeting))
+    func trueShown_operationTest_trueNotShown_geo_segment() async throws {
+        let config = try InappTargetingConfig.nineRequests.getConfig()
+
+        persistenceStorage.shownDatesByInApp = ["1": [Date()]]
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        targetingChecker.checkedSegmentations = [
+            .init(segmentation: .init(ids: .init(externalId: "0000000")), segment: nil)
+        ]
+        SessionTemporaryStorage.shared.segmentationRequestResult = .success(targetingChecker.checkedSegmentations)
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "3")
+        assertTargetingEquals(ids: ["3", "1", "4", "5"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let event = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: event, config: config)
+        assertTargetingEquals(ids: ["2"])
+    }
+
+    @Test("One in-app for operation 1 OR 2", .tags(.remainingTargeting))
+    func oneInapp_twoOperations1Or2() async throws {
+        let config = try InappTargetingConfig.fourteenRequests.getConfig()
+
+        let event1 = ApplicationEvent(name: "1", model: nil)
+        await handleInapps(event: event1, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let event2 = ApplicationEvent(name: "2", model: nil)
+        await handleInapps(event: event2, config: config)
+        assertTargetingEquals(ids: ["1"])
+    }
+
+    @Test("One in-app for operation and segment", .tags(.remainingTargeting))
+    func oneInapp_forOperationAndSegment() async throws {
+        let config = try InappTargetingConfig.fifteenTargeting.getConfig()
+
+        targetingChecker.checkedSegmentations = [
+            .init(segmentation: .init(ids: .init(externalId: "0000000")), segment: nil)
+        ]
+        SessionTemporaryStorage.shared.segmentationRequestResult = .success(targetingChecker.checkedSegmentations)
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingEquals(ids: [])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let event = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: event, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1"])
+    }
+
+    @Test("True + operation test", .tags(.remainingTargeting))
+    func true_operationTest() async throws {
+        let config = try InappTargetingConfig.sixteenSeventeenRequests.getConfig()
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEvent = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: testEvent, config: config)
+        assertTargetingEquals(ids: ["2"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testAgain = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: testAgain, config: config)
+        assertTargetingEquals(ids: ["2"])
+    }
+
+    @Test("Unknown in-app + lower SDK + true in-app", .tags(.remainingTargeting))
+    func unknownInapp_lowerSDK_trueInapp() async throws {
+        let config = try InappTargetingConfig.twentySevenRequests.getConfig()
+        await handleInapps(event: nil, config: config)
+        assertTargetingEquals(ids: ["3"])
+    }
+
+    // MARK: - A/B tests (31-TargetingRequests)
+
+    @Test("Four in-apps with A/B tests, device variant 1", .tags(.remainingTargeting, .abTesting))
+    func fourInappsWithABTests_variant1() async throws {
+        let config = try InappTargetingConfig.thirtyOneRequests.getConfig()
+        persistenceStorage.deviceUUID = "40909d27-4bef-4a8d-9164-6bfcf58ecc76"
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        await handleInapps(event: nil, config: config)
+
+        await waitForTargetingArray(expectedCount: 3)
+        assertTargetingEquals(ids: ["1", "2", "3"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEventAgain = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: testEventAgain, config: config)
+        assertTargetingEquals(ids: ["4"])
+    }
+
+    @Test("Four in-apps with A/B tests, device variant 2", .tags(.remainingTargeting, .abTesting))
+    func fourInappsWithABTests_variant2() async throws {
+        let config = try InappTargetingConfig.thirtyOneRequests.getConfig()
+        persistenceStorage.deviceUUID = "b4e0f767-fe8f-4825-9772-f1162f2db52d"
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        await handleInapps(event: nil, config: config)
+        await waitForTargetingArray(expectedCount: 3)
+        assertTargetingEquals(ids: ["1", "2", "3"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEventAgain = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: testEventAgain, config: config)
+        assertTargetingEquals(ids: ["4"])
+    }
+
+    @Test("Four in-apps with A/B tests, device variant 3", .tags(.remainingTargeting, .abTesting))
+    func fourInappsWithABTests_variant3() async throws {
+        let config = try InappTargetingConfig.thirtyOneRequests.getConfig()
+        persistenceStorage.deviceUUID = "55fbd965-c658-47a8-8786-d72ba79b38a2"
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        await handleInapps(event: nil, config: config)
+        await waitForTargetingArray(expectedCount: 3)
+        assertTargetingEquals(ids: ["1", "2", "3"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEventAgain = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: testEventAgain, config: config)
+        assertTargetingEquals(ids: ["4"])
+    }
+
+    // MARK: - Geo + operations (44 / 45 / 46)
+
+    @Test("geoFitOrTest + test + test2, initial geo", .tags(.remainingTargeting, .geoTargeting))
+    func geoFitOrTest_operationTest_operationTest_operationTest2_geo() async throws {
+        let config = try InappTargetingConfig.fortyFourTargeting.getConfig()
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1", "5"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEvent = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: testEvent, config: config)
+        assertTargetingEquals(ids: ["1", "2", "3"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEvent2 = ApplicationEvent(name: "test2", model: nil)
+        await handleInapps(event: testEvent2, config: config)
+        assertTargetingEquals(ids: ["4"])
+    }
+
+    @Test("geo + test + test2 + geoFitOrTest", .tags(.remainingTargeting, .geoTargeting))
+    func geo_operationTest_operationTest_operationTest2_geoFitOrTest() async throws {
+        let config = try InappTargetingConfig.fortyFiveTargeting.getConfig()
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1", "5"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEvent = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: testEvent, config: config)
+        assertTargetingEquals(ids: ["2", "3", "5"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEvent2 = ApplicationEvent(name: "test2", model: nil)
+        await handleInapps(event: testEvent2, config: config)
+        assertTargetingEquals(ids: ["4"])
+    }
+
+    @Test("geoFitOrTest + test + test2 + geoFitOrTest", .tags(.remainingTargeting, .geoTargeting))
+    func geoFitOrTest_operationTest_operationTest_operationTest2_geoFitOrTest() async throws {
+        let config = try InappTargetingConfig.fortySixTargeting.getConfig()
+        targetingChecker.geoModels = .init(city: 1, region: 2, country: 3)
+        SessionTemporaryStorage.shared.geoRequestResult = .success(targetingChecker.geoModels)
+
+        await handleInapps(event: nil, config: config)
+        assertTargetingShows(id: "1")
+        assertTargetingEquals(ids: ["1", "5"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEvent = ApplicationEvent(name: "test", model: nil)
+        await handleInapps(event: testEvent, config: config)
+        assertTargetingEquals(ids: ["1", "2", "3", "5"])
+
+        mockDataFacade.cleanTargetingArray()
+
+        let testEvent2 = ApplicationEvent(name: "test2", model: nil)
+        await handleInapps(event: testEvent2, config: config)
+        assertTargetingEquals(ids: ["4"])
+    }
+}

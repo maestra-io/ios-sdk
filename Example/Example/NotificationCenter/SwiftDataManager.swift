@@ -1,0 +1,119 @@
+//
+//  SwiftDataManager.swift
+//  Example
+//
+//  Created by Sergei Semko on 6/11/24.
+//  Copyright © 2024 Mindbox. All rights reserved.
+//
+
+import Foundation
+import SwiftData
+import SwiftUI
+
+public struct SwiftDataManager {
+    public static let shared = SwiftDataManager()
+    public var container: ModelContainer
+    
+    private var mockDataSaved: Bool {
+        UserDefaults.standard.bool(forKey: "isMockDataSaved")
+    }
+    
+    private init() {
+        SwiftDataManager.createDirectoryForSwiftData()
+        
+        let schema = Schema([
+            Item.self,
+        ])
+        
+        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
+        
+        do {
+            container = try ModelContainer(for: schema, configurations: [modelConfiguration])
+        } catch {
+            fatalError("Could not create ModelContainer: \(error)")
+        }
+    }
+    
+    public func saveMockDataIfNeeded() {
+        guard !mockDataSaved else {
+            print("MockData already saved")
+            return
+        }
+        Task {
+            await saveMockData()
+        }
+        UserDefaults.standard.set(true, forKey: "isMockDataSaved")
+    }
+    
+    @MainActor
+    private func saveMockData() {
+        let context = SwiftDataManager.shared.container.mainContext
+        
+        mockNotifications.forEach { notification in
+            let newItem = Item(timestamp: Date(), pushNotification: notification)
+            
+            context.insert(newItem)
+            
+            do {
+                try context.save()
+            } catch {
+                print("Failed to save context: \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    private static func createDirectoryForSwiftData() {
+        let fileManager = FileManager.default
+        let appGroupIdentifier = "group.cloud.Mindbox.io.maestra.example.iOS"
+        if let appGroupURL = fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) {
+            let applicationSupportURL = appGroupURL.appendingPathComponent("Library/Application Support")
+            
+            if !fileManager.fileExists(atPath: applicationSupportURL.path) {
+                do {
+                    try fileManager.createDirectory(at: applicationSupportURL, withIntermediateDirectories: true, attributes: nil)
+                } catch {
+                    print("Failed to create Application Support directory: \(error)")
+                }
+            } else {
+                print("Application Support directory already exists at \(applicationSupportURL.path)")
+            }
+        } else {
+            // Best-effort: the SwiftData store falls back to the app's default
+            // location, so a missing App Group container must not crash the host.
+            print("App Group container URL is unavailable; skipping SwiftData directory setup.")
+        }
+    }
+}
+
+private extension SwiftDataManager {
+    var mockNotifications: [PushNotification] {
+        [
+            PushNotification(
+                title: "First notification title",
+                body: "First notification body",
+                clickUrl: "https://maestra.io/",
+                imageUrl: "https://sdk.maestra-static.io/demo-images/307be696-77e6-4d83-b7eb-c94be85f7a03.png",
+                payload: "{\"pushName\": \"<Push name>\", \"pushDate\": \"<Push date>\"}",
+                uniqueKey: "Push unique key: 1"
+            ),
+            
+            PushNotification(
+                title: "Second notification title",
+                body: "Second notification body",
+                clickUrl: "https://maestra.io/",
+                imageUrl: "https://sdk.maestra-static.io/demo-images/2397fea9-383d-49bf-a6a0-181a267faa94.png",
+                payload: "{\"pushName\": \"<Push name>\", \"pushDate\": \"<Push date>\"}",
+                uniqueKey: "Push unique key: 2"
+            ),
+            
+            PushNotification(
+                title: "Third notification title",
+                body: "Third notification body",
+                clickUrl: "https://maestra.io/",
+                imageUrl: "https://sdk.maestra-static.io/demo-images/bd4250b1-a7ac-4b8a-b91b-481b3b5c565c.png",
+                payload: "{\"pushName\": \"<Push name>\", \"pushDate\": \"<Push date>\"}",
+                uniqueKey: "Push unique key: 3"
+            ),
+        ]
+    }
+}

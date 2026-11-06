@@ -1,0 +1,44 @@
+//
+//  ImageDownloader.swift
+//  Mindbox
+//
+//  Created by Maksim Kazakov on 06.09.2022.
+//  Copyright © 2022 Mikhail Barilov. All rights reserved.
+//
+
+import Foundation
+import UIKit
+
+protocol ImageDownloader {
+    func downloadImage(withUrl imageUrl: String, completion: @escaping (URL?, HTTPURLResponse?, Error?) -> Void)
+}
+
+class URLSessionImageDownloader: ImageDownloader {
+
+    private let persistenceStorage: PersistenceStorage
+    private let makeSession: (URLSessionConfiguration) -> URLSession
+
+    init(persistenceStorage: PersistenceStorage,
+         makeSession: @escaping (URLSessionConfiguration) -> URLSession = { URLSession(configuration: $0) }) {
+        self.persistenceStorage = persistenceStorage
+        self.makeSession = makeSession
+    }
+
+    func downloadImage(withUrl imageUrl: String, completion: @escaping (URL?, HTTPURLResponse?, Error?) -> Void) {
+        guard let url = URL(string: imageUrl) else {
+            completion(nil, nil, NSError(domain: "Invalid URL", code: -1, userInfo: nil))
+            return
+        }
+
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForResource = persistenceStorage.imageLoadingMaxTimeInSeconds ?? 3
+        let session = makeSession(configuration)
+
+        let downloadTask = session.downloadTask(with: url) { localURL, response, error in
+            completion(localURL, response as? HTTPURLResponse, error)
+        }
+
+        downloadTask.resume()
+        session.finishTasksAndInvalidate()
+    }
+}

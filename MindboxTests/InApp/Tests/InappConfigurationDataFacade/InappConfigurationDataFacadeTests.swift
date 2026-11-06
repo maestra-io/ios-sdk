@@ -1,0 +1,514 @@
+//
+//  InappConfigurationDataFacadeTests.swift
+//  MindboxTests
+//
+//  Created by Akylbek Utekeshev on 21.04.2025.
+//  Copyright © 2025 Mindbox. All rights reserved.
+//
+
+import XCTest
+import Testing
+@testable import Mindbox
+
+final class MockSegmentationService: SegmentationServiceProtocol {
+    var stubResponse: [InAppProductSegmentResponse.CustomerSegmentation]?
+    var stubError: MindboxError?
+    
+    private(set) var requestedProducts: ProductCategory?
+    
+    init(stubResponse: [InAppProductSegmentResponse.CustomerSegmentation]? = nil) {
+        self.stubResponse = stubResponse
+    }
+    
+    func checkSegmentationRequest(
+        completion: @escaping (Result<[SegmentationCheckResponse.CustomerSegmentation]?, MindboxError>) -> Void
+    ) {
+        if let stubError {
+            completion(.failure(stubError))
+            return
+        }
+        completion(.success(nil))
+    }
+    
+    func checkProductSegmentationRequest(
+        products: ProductCategory,
+        completion: @escaping (Result<[InAppProductSegmentResponse.CustomerSegmentation]?, MindboxError>) -> Void
+    ) {
+        requestedProducts = products
+        if let stubError {
+            completion(.failure(stubError))
+            return
+        }
+        completion(.success(stubResponse))
+    }
+}
+
+final class MockInappShowFailureManager: InappShowFailureManagerProtocol {
+    private(set) var failures: [(inappId: String, reason: InAppShowFailureReason, details: String?, tags: [String: String]?)] = []
+
+    func addFailure(inappId: String, reason: InAppShowFailureReason, details: String?, tags: [String: String]?) {
+        failures.append((inappId: inappId, reason: reason, details: details, tags: tags))
+    }
+
+    private(set) var sentAtOnce: [(inappId: String, reason: InAppShowFailureReason)] = []
+
+    func sendBlockFailure(inappId: String, reason: InAppShowFailureReason, details: String?, tags: [String: String]?) {
+        sentAtOnce.append((inappId: inappId, reason: reason))
+    }
+
+    func sendFailure(inappId: String, reason: InAppShowFailureReason, details: String?, tags: [String: String]?) {}
+
+    func sendFailures() {}
+
+    private(set) var clearFailuresCallCount = 0
+
+    func clearFailures() {
+        clearFailuresCallCount += 1
+    }
+
+    func sendWaitBudgetExceeded(place: String, waited: TimeInterval, phase: EmbeddedBlockShowFailure.Phase) {}
+}
+
+final class InAppConfigurationDataFacadeTests: XCTestCase {
+    var mockSegmentation: MockSegmentationService!
+    var mockFailureManager: MockInappShowFailureManager!
+    var dataFacade: InAppConfigurationDataFacade!
+    
+    override func setUp() {
+        super.setUp()
+        mockSegmentation = MockSegmentationService()
+        mockFailureManager = MockInappShowFailureManager()
+        let targetingChecker = DI.injectOrFail(InAppTargetingCheckerProtocol.self)
+        let imageService = DI.injectOrFail(ImageDownloadServiceProtocol.self)
+        let tracker = DI.injectOrFail(InAppMessagesTracker.self)
+        dataFacade = InAppConfigurationDataFacade(
+            segmentationService: mockSegmentation,
+            targetingChecker: targetingChecker,
+            imageService: imageService,
+            tracker: tracker,
+            failureManager: mockFailureManager
+        )
+    }
+    
+    override func tearDown() {
+        dataFacade.targetingChecker.eraseCache()
+        (DI.inject(NetworkFetcher.self) as? MockNetworkFetcher)?.error = nil
+        dataFacade = nil
+        mockSegmentation = nil
+        mockFailureManager = nil
+        SessionTemporaryStorage.shared.erase()
+        
+        super.tearDown()
+    }
+    
+    func test_skipFetch_whenEventNameMismatch() {
+        SessionTemporaryStorage.shared.viewProductOperation = "App.ViewProduct".lowercased()
+        let model = decodeInAppOperationJSONModel(from: """
+            { "viewProduct": { "product": { "ids": { "website": "100" } } } }
+        """
+        )
+        dataFacade.targetingChecker.event = ApplicationEvent(
+            name: "Other.Event".lowercased(), model: model
+        )
+        mockSegmentation.stubResponse = [
+            InAppProductSegmentResponse.CustomerSegmentation(
+                ids: .init(externalId: "1"),
+                segment: .init(ids: .init(externalId: "2"))
+            )
+        ]
+        dataFacade.fetchProductSegmentationIfNeeded(products: model?.viewProduct?.product)
+        XCTAssertNil(mockSegmentation.requestedProducts)
+        XCTAssertTrue(dataFacade.targetingChecker.checkedProductSegmentations.isEmpty)
+    }
+    
+    func test_skipFetch_whenProductsNilOrEmpty() {
+        SessionTemporaryStorage.shared.viewProductOperation = "App.ViewProduct".lowercased()
+        dataFacade.targetingChecker.event = ApplicationEvent(name: "App.ViewProduct", model: nil)
+        dataFacade.fetchProductSegmentationIfNeeded(products: nil)
+        XCTAssertNil(mockSegmentation.requestedProducts)
+        XCTAssertTrue(dataFacade.targetingChecker.checkedProductSegmentations.isEmpty)
+        
+        let emptyProducts = ProductCategory(ids: [:])
+        dataFacade.targetingChecker.event = ApplicationEvent(
+            name: "App.ViewProduct", model: decodeInAppOperationJSONModel(from: "{ }")
+        )
+        dataFacade.fetchProductSegmentationIfNeeded(products: emptyProducts)
+        XCTAssertNil(mockSegmentation.requestedProducts)
+        XCTAssertTrue(dataFacade.targetingChecker.checkedProductSegmentations.isEmpty)
+    }
+    
+    func test_skipFetch_whenAlreadyChecked() {
+        let model = decodeInAppOperationJSONModel(from: """
+            { "viewProduct": { "product": { "ids": { "website": "100" } } } }
+        """
+        )
+        let products = model!.viewProduct!.product
+        dataFacade.targetingChecker.event = ApplicationEvent(name: "App.ViewProduct", model: model)
+        let firstKey = products.firstProduct!
+        dataFacade.targetingChecker.checkedProductSegmentations[firstKey] = [
+            InAppProductSegmentResponse.CustomerSegmentation(
+                ids: .init(externalId: "old"),
+                segment: .init(ids: .init(externalId: "x"))
+            )
+        ]
+        dataFacade.fetchProductSegmentationIfNeeded(products: products)
+        XCTAssertNil(mockSegmentation.requestedProducts)
+        XCTAssertEqual(
+            dataFacade.targetingChecker.checkedProductSegmentations[firstKey]?.first?.ids.externalId,
+            "old"
+        )
+    }
+    
+    func test_storeSegments_whenServiceReturnsData() {
+        SessionTemporaryStorage.shared.viewProductOperation = "App.ViewProduct".lowercased()
+        let model = decodeInAppOperationJSONModel(from: """
+            { "viewProduct": { "product": { "ids": { "website": "100" } } } }
+        """
+        )
+        let products = model!.viewProduct!.product
+        dataFacade.targetingChecker.event = ApplicationEvent(name: "App.ViewProduct", model: model)
+        let expectedSegments = [
+            InAppProductSegmentResponse.CustomerSegmentation(
+                ids: .init(externalId: "1"),
+                segment: .init(ids: .init(externalId: "2"))
+            )
+        ]
+        mockSegmentation.stubResponse = expectedSegments
+        dataFacade.fetchProductSegmentationIfNeeded(products: products)
+        XCTAssertEqual(mockSegmentation.requestedProducts, products)
+        let key = products.firstProduct!
+        XCTAssertEqual(dataFacade.targetingChecker.checkedProductSegmentations[key], expectedSegments)
+    }
+    
+    func test_skipStore_whenServiceReturnsNil() {
+        SessionTemporaryStorage.shared.viewProductOperation = "App.ViewProduct".lowercased()
+        let model = decodeInAppOperationJSONModel(from: """
+            { "viewProduct": { "product": { "ids": { "website": "100" } } } }
+        """
+        )
+        let products = model!.viewProduct!.product
+        dataFacade.targetingChecker.event = ApplicationEvent(name: "App.ViewProduct", model: model)
+        mockSegmentation.stubResponse = nil
+        dataFacade.fetchProductSegmentationIfNeeded(products: products)
+        XCTAssertEqual(mockSegmentation.requestedProducts, products)
+        XCTAssertNil(dataFacade.targetingChecker.checkedProductSegmentations[products.firstProduct!])
+    }
+
+    func test_addFailure_whenProductSegmentationReturnsServerError() {
+        SessionTemporaryStorage.shared.viewProductOperation = "App.ViewProduct".lowercased()
+        let model = decodeInAppOperationJSONModel(from: """
+            { "viewProduct": { "product": { "ids": { "website": "100" } } } }
+        """
+        )
+        let products = model!.viewProduct!.product
+        dataFacade.targetingChecker.event = ApplicationEvent(name: "App.ViewProduct", model: model)
+        dataFacade.targetingChecker.context.productSegmentInapps = ["inapp-1", "inapp-2"]
+        mockSegmentation.stubError = .serverError(.init(status: .internalServerError, errorMessage: "Internal Server error", httpStatusCode: 500))
+
+        dataFacade.fetchProductSegmentationIfNeeded(products: products)
+        dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-2", "inapp-other"], tagsByInappId: [:])
+
+        XCTAssertEqual(mockFailureManager.failures.count, 1)
+        XCTAssertEqual(Set(mockFailureManager.failures.map { $0.inappId }), Set(["inapp-2"]))
+        XCTAssertTrue(mockFailureManager.failures.allSatisfy { $0.reason == .productSegmentRequestFailed })
+    }
+
+    func test_discardCollectedFailures_dropsWhatThePassBuffered() {
+        dataFacade.discardCollectedFailures()
+
+        XCTAssertEqual(mockFailureManager.clearFailuresCallCount, 1)
+    }
+
+    func test_collectTargetingFailures_propagatesTagsByInappId() {
+        SessionTemporaryStorage.shared.viewProductOperation = "App.ViewProduct".lowercased()
+        let model = decodeInAppOperationJSONModel(from: """
+            { "viewProduct": { "product": { "ids": { "website": "100" } } } }
+        """
+        )
+        let products = model!.viewProduct!.product
+        dataFacade.targetingChecker.event = ApplicationEvent(name: "App.ViewProduct", model: model)
+        dataFacade.targetingChecker.context.productSegmentInapps = ["inapp-tagged"]
+        mockSegmentation.stubError = .serverError(.init(status: .internalServerError, errorMessage: "Internal Server error", httpStatusCode: 500))
+
+        dataFacade.fetchProductSegmentationIfNeeded(products: products)
+        dataFacade.collectTargetingFailures(
+            forFailedTargetingInappIds: ["inapp-tagged"],
+            tagsByInappId: ["inapp-tagged": ["templateType": "Popup"]]
+        )
+
+        XCTAssertEqual(mockFailureManager.failures.count, 1)
+        XCTAssertEqual(mockFailureManager.failures.first?.tags, ["templateType": "Popup"])
+    }
+
+    func test_doNotAddFailure_whenProductSegmentationReturnsNonServerError() {
+        SessionTemporaryStorage.shared.viewProductOperation = "App.ViewProduct".lowercased()
+        let model = decodeInAppOperationJSONModel(from: """
+            { "viewProduct": { "product": { "ids": { "website": "100" } } } }
+        """
+        )
+        let products = model!.viewProduct!.product
+        dataFacade.targetingChecker.event = ApplicationEvent(name: "App.ViewProduct", model: model)
+        dataFacade.targetingChecker.context.productSegmentInapps = ["inapp-1"]
+        mockSegmentation.stubError = .protocolError(.init(status: .protocolError, errorMessage: "Bad request", httpStatusCode: 400))
+
+        dataFacade.fetchProductSegmentationIfNeeded(products: products)
+        dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-1"], tagsByInappId: [:])
+
+        XCTAssertTrue(mockFailureManager.failures.isEmpty)
+    }
+
+    func test_addFailure_whenSegmentationReturnsServerError() {
+        dataFacade.targetingChecker.context.segmentInapps = ["inapp-segment-1", "inapp-segment-2"]
+        dataFacade.targetingChecker.context.segments = ["segment-id"]
+        mockSegmentation.stubError = .serverError(.init(status: .internalServerError, errorMessage: "Internal Server error", httpStatusCode: 500))
+        let expectation = expectation(description: "fetch dependencies")
+
+        dataFacade.fetchDependencies(model: nil) {
+            expectation.fulfill()
+        }
+
+        waitForExpectations(timeout: 1)
+        dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-segment-2", "inapp-other"], tagsByInappId: [:])
+
+        XCTAssertEqual(mockFailureManager.failures.count, 1)
+        XCTAssertEqual(Set(mockFailureManager.failures.map { $0.inappId }), Set(["inapp-segment-2"]))
+        XCTAssertTrue(mockFailureManager.failures.allSatisfy { $0.reason == .customerSegmentRequestFailed })
+    }
+
+    private func fetchDependencies() {
+        let expectation = expectation(description: "fetch dependencies")
+        dataFacade.fetchDependencies(model: nil) { expectation.fulfill() }
+        waitForExpectations(timeout: 1)
+    }
+
+    func test_reportsUnchecked_whenSegmentationFailedOnTheServerAndACandidateDependsOnIt() {
+        dataFacade.targetingChecker.context.segmentInapps = ["inapp-segment"]
+        dataFacade.targetingChecker.context.segments = ["segment-id"]
+        mockSegmentation.stubError = .serverError(.init(status: .internalServerError, errorMessage: "Internal Server error", httpStatusCode: 500))
+        fetchDependencies()
+
+        let unchecked = dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-segment", "inapp-other"], tagsByInappId: [:])
+
+        XCTAssertTrue(unchecked)
+        XCTAssertEqual(mockFailureManager.failures.map(\.inappId), ["inapp-segment"])
+    }
+
+    func test_reportsUnchecked_whenSegmentationFailedOfflineButReportsNoFailure() {
+        dataFacade.targetingChecker.context.segmentInapps = ["inapp-segment"]
+        dataFacade.targetingChecker.context.segments = ["segment-id"]
+        mockSegmentation.stubError = .connectionError
+        fetchDependencies()
+
+        let unchecked = dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-segment"], tagsByInappId: [:])
+
+        XCTAssertTrue(unchecked)
+        XCTAssertTrue(mockFailureManager.failures.isEmpty)
+    }
+
+    func test_reportsUnchecked_whenGeoFailedOffline() {
+        let networkFetcher = DI.injectOrFail(NetworkFetcher.self) as? MockNetworkFetcher
+        networkFetcher?.error = .connectionError
+        dataFacade.targetingChecker.context.geoInapps = ["inapp-geo"]
+        dataFacade.targetingChecker.context.isNeedGeoRequest = true
+        fetchDependencies()
+
+        let unchecked = dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-geo"], tagsByInappId: [:])
+
+        XCTAssertTrue(unchecked)
+        XCTAssertTrue(mockFailureManager.failures.isEmpty)
+    }
+
+    func test_reportsChecked_whenNoFailedCandidateDependsOnTheFailedFetch() {
+        dataFacade.targetingChecker.context.segmentInapps = ["inapp-segment"]
+        dataFacade.targetingChecker.context.segments = ["segment-id"]
+        mockSegmentation.stubError = .connectionError
+        fetchDependencies()
+
+        let unchecked = dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-other"], tagsByInappId: [:])
+
+        XCTAssertFalse(unchecked)
+    }
+
+    func test_reportsChecked_onTheNextPassWhoseFetchSucceeded() {
+        dataFacade.targetingChecker.context.segmentInapps = ["inapp-segment"]
+        dataFacade.targetingChecker.context.segments = ["segment-id"]
+        mockSegmentation.stubError = .connectionError
+        fetchDependencies()
+        XCTAssertTrue(dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-segment"], tagsByInappId: [:]))
+
+        mockSegmentation.stubError = nil
+        fetchDependencies()
+
+        XCTAssertFalse(dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-segment"], tagsByInappId: [:]))
+    }
+
+    func test_addFailure_whenSegmentationRequestFailedBefore_returnsCachedFailureOnNextFetch() {
+        SessionTemporaryStorage.shared.segmentationRequestResult = nil
+        let targetingChecker = DI.injectOrFail(InAppTargetingCheckerProtocol.self)
+        targetingChecker.eraseCache()
+        targetingChecker.context.segmentInapps = ["inapp-segment"]
+        targetingChecker.context.segments = ["segment-id"]
+
+        let imageService = DI.injectOrFail(ImageDownloadServiceProtocol.self)
+        let tracker = DI.injectOrFail(InAppMessagesTracker.self)
+        let localFailureManager = MockInappShowFailureManager()
+
+        var requestCallCount = 0
+        var shouldReturnFailure = true
+        let segmentationService = SegmentationService(
+            customerSegmentsAPI: CustomerSegmentsAPI(
+                fetchSegments: { _, completion in
+                    requestCallCount += 1
+                    if shouldReturnFailure {
+                        completion(.failure(.serverError(.init(
+                            status: .internalServerError,
+                            errorMessage: "Internal Server error",
+                            httpStatusCode: 500
+                        ))))
+                    } else {
+                        completion(.success(.init(status: .success, customerSegmentations: [])))
+                    }
+                },
+                fetchProductSegments: { _, completion in
+                    completion(.success(.init(status: .success, products: nil)))
+                }
+            ),
+            targetingChecker: targetingChecker
+        )
+
+        let facade = InAppConfigurationDataFacade(
+            segmentationService: segmentationService,
+            targetingChecker: targetingChecker,
+            imageService: imageService,
+            tracker: tracker,
+            failureManager: localFailureManager
+        )
+
+        let firstExpectation = expectation(description: "first fetch dependencies")
+        facade.fetchDependencies(model: nil) {
+            firstExpectation.fulfill()
+        }
+        waitForExpectations(timeout: 1)
+        facade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-segment"], tagsByInappId: [:])
+
+        shouldReturnFailure = false
+        let secondExpectation = expectation(description: "second fetch dependencies")
+        facade.fetchDependencies(model: nil) {
+            secondExpectation.fulfill()
+        }
+        waitForExpectations(timeout: 1)
+        facade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-segment"], tagsByInappId: [:])
+
+        XCTAssertEqual(requestCallCount, 1)
+        XCTAssertEqual(localFailureManager.failures.count, 2)
+        XCTAssertTrue(localFailureManager.failures.allSatisfy { $0.reason == .customerSegmentRequestFailed })
+        XCTAssertEqual(localFailureManager.failures.map { $0.inappId }, ["inapp-segment", "inapp-segment"])
+    }
+
+    func test_doNotAddFailure_whenShouldCollectFailuresIsFalse() {
+        dataFacade.targetingChecker.context.segmentInapps = ["inapp-segment"]
+        dataFacade.targetingChecker.context.segments = ["segment-id"]
+        mockSegmentation.stubError = .serverError(.init(status: .internalServerError, errorMessage: "Internal Server error", httpStatusCode: 500))
+        let expectation = expectation(description: "fetch dependencies")
+
+        dataFacade.fetchDependencies(model: nil, shouldCollectFailures: false) {
+            expectation.fulfill()
+        }
+
+        waitForExpectations(timeout: 1)
+        dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-segment"], tagsByInappId: [:])
+
+        XCTAssertTrue(mockFailureManager.failures.isEmpty)
+    }
+
+    func test_addFailure_whenGeoReturnsServerError() {
+        let networkFetcher = DI.injectOrFail(NetworkFetcher.self) as? MockNetworkFetcher
+        networkFetcher?.error = .serverError(.init(status: .internalServerError, errorMessage: "Internal Server error", httpStatusCode: 500))
+        dataFacade.targetingChecker.context.geoInapps = ["inapp-geo"]
+        dataFacade.targetingChecker.context.isNeedGeoRequest = true
+        let expectation = expectation(description: "fetch dependencies")
+
+        dataFacade.fetchDependencies(model: nil) {
+            expectation.fulfill()
+        }
+
+        waitForExpectations(timeout: 1)
+        dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-geo", "inapp-other"], tagsByInappId: [:])
+
+        XCTAssertEqual(mockFailureManager.failures.count, 1)
+        XCTAssertEqual(mockFailureManager.failures.first?.inappId, "inapp-geo")
+        XCTAssertEqual(mockFailureManager.failures.first?.reason, .geoRequestFailed)
+    }
+
+    func test_addFailure_whenGeoRequestFailedBefore_returnsCachedFailureOnNextFetch() {
+        let networkFetcher = DI.injectOrFail(NetworkFetcher.self) as? MockNetworkFetcher
+        networkFetcher?.error = .serverError(.init(status: .internalServerError, errorMessage: "Internal Server error", httpStatusCode: 500))
+        dataFacade.targetingChecker.context.geoInapps = ["inapp-geo"]
+        dataFacade.targetingChecker.context.isNeedGeoRequest = true
+
+        let firstExpectation = expectation(description: "first fetch dependencies")
+        dataFacade.fetchDependencies(model: nil) {
+            firstExpectation.fulfill()
+        }
+        waitForExpectations(timeout: 1)
+        dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-geo"], tagsByInappId: [:])
+
+        networkFetcher?.error = nil
+        let secondExpectation = expectation(description: "second fetch dependencies")
+        dataFacade.fetchDependencies(model: nil) {
+            secondExpectation.fulfill()
+        }
+        waitForExpectations(timeout: 1)
+        dataFacade.collectTargetingFailures(forFailedTargetingInappIds: ["inapp-geo"], tagsByInappId: [:])
+
+        XCTAssertEqual(mockFailureManager.failures.count, 2)
+        XCTAssertTrue(mockFailureManager.failures.allSatisfy { $0.reason == .geoRequestFailed })
+        XCTAssertEqual(mockFailureManager.failures.map { $0.inappId }, ["inapp-geo", "inapp-geo"])
+    }
+    
+    private func decodeInAppOperationJSONModel(from jsonString: String) -> InappOperationJSONModel? {
+        guard let data = jsonString.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(InappOperationJSONModel.self, from: data)
+    }
+}
+
+@Suite("Where the facade reports an in-app's failed image download")
+struct InAppConfigurationDataFacadeImageFailureTests {
+
+    private let failureManager = MockInappShowFailureManager()
+    private let dataFacade: InAppConfigurationDataFacade
+
+    init() {
+        TestConfiguration.configure()
+        dataFacade = InAppConfigurationDataFacade(segmentationService: MockSegmentationService(),
+                                                  targetingChecker: DI.injectOrFail(InAppTargetingCheckerProtocol.self),
+                                                  imageService: MockImageDownloadService(),
+                                                  tracker: DI.injectOrFail(InAppMessagesTracker.self),
+                                                  failureManager: failureManager)
+    }
+
+    private func downloadMissingImage(reporting report: ImageFailureReport) async {
+        await withCheckedContinuation { continuation in
+            dataFacade.downloadImage(withUrl: "https://example.com/missing.jpg", inappId: "inapp-1", tags: nil, failureReport: report) { _ in
+                continuation.resume()
+            }
+        }
+    }
+
+    @Test("A pass's failed image download waits in the pass's buffer")
+    func passImageFailureIsBuffered() async {
+        await downloadMissingImage(reporting: .bufferedForThePass)
+
+        #expect(failureManager.failures.map(\.inappId) == ["inapp-1"])
+        #expect(failureManager.sentAtOnce.isEmpty)
+    }
+
+    @Test("A tap's failed image download is sent at once, past the buffer")
+    func tapImageFailureIsSentAtOnce() async {
+        await downloadMissingImage(reporting: .atOnce)
+
+        #expect(failureManager.sentAtOnce.map(\.inappId) == ["inapp-1"])
+        #expect(failureManager.sentAtOnce.map(\.reason) == [.imageDownloadFailed])
+        #expect(failureManager.failures.isEmpty)
+    }
+}

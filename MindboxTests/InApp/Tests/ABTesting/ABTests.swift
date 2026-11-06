@@ -1,0 +1,569 @@
+////
+////  ABTests.swift
+////  MindboxTests
+////
+////  Created by vailence on 19.06.2023.
+////  Copyright © 2023 Mindbox. All rights reserved.
+////
+
+// swiftlint:disable file_length
+
+import Foundation
+import XCTest
+@testable import Mindbox
+
+fileprivate enum InappConfig: String, Configurable {
+    typealias DecodeType = ConfigResponse
+
+    case configWithABTest = "ConfigWithAB_1"
+    case configWithABTestTwo = "ConfigWithAB_2"
+    case configWithABBrokenRange = "ConfigWithABBrokenRange"
+    case configWithABNoSalt = "ConfigWithABNoSalt"
+    case configWithABUnexpectedValue = "ConfigWithABUnexpectedValue"
+    case configWithABCrossRange = "ConfigWithABCrossRange"
+    case configWithABNoUpper = "ConfigWithABNoUpper"
+    case configWithABLowerBiggerThanUpper = "ConfigWithABLowerBiggerThanUpper"
+    case configWithABNormal = "ConfigWithABNormal"
+    case configWithABTypeNotInapps = "ConfigWithABTypeNotInapps"
+}
+class ABTests: XCTestCase {
+
+    private var inappFilter: InappsFilterService!
+    private var persistenceStorage: PersistenceStorage!
+    private var stub: ABTestsStub!
+
+    override func setUp() {
+        super.setUp()
+        self.inappFilter = DI.injectOrFail(InappFilterProtocol.self) as? InappsFilterService
+        self.persistenceStorage = DI.injectOrFail(PersistenceStorage.self)
+        self.stub = ABTestsStub()
+    }
+
+    override func tearDown() {
+        self.inappFilter = nil
+        self.persistenceStorage = nil
+        self.stub = nil
+        super.tearDown()
+    }
+
+    func test_no_abtests() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+        let expectedIds: Set = [
+            "1",
+            "2",
+            "3"
+        ]
+
+        persistenceStorage.deviceUUID = "BBBC2BA1-0B5B-4C9E-AB0E-95C54775B4F1"
+        let inapps = inappFilter.filterInappsByABTests(nil, responseInapps: filteredInapps)
+
+        XCTAssertEqual(inapps.count, expectedIds.count, "The number of in-apps does not match the expected one")
+
+        let inappIds = Set(inapps.map { $0.id })
+        XCTAssertEqual(inappIds, expectedIds, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_compare_inapps_with_cg() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(variants: [
+                stub.getVariantConcrete(id: "2", lower: 0, upper: 50),
+                stub.getVariantAll(lower: 50, upper: 100)
+            ])
+        ]
+
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+        persistenceStorage.deviceUUID = "4078E211-7C3F-C607-D35C-DC6B591EF355"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsFirstVariant.count, 0, "The number of in-apps does not match the expected one")
+
+        let expectedIdsForVariantTwo: Set = [
+            "1",
+            "2",
+            "3"
+        ]
+
+        persistenceStorage.deviceUUID = "4D27710A-3F3A-FF6E-7764-375B1E06E05D"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsSecondVariant.count, expectedIdsForVariantTwo.count, "The number of in-apps does not match the expected one")
+
+        let inappIds = Set(inappsSecondVariant.map { $0.id })
+        XCTAssertEqual(inappIds, expectedIdsForVariantTwo, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_compare_cg_and_concrete_inapps() throws {
+        let response = try InappConfig.configWithABTestTwo.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(variants: [
+                stub.getVariantConcrete(lower: 0, upper: 50),
+                stub.getVariantConcrete(id: "2", lower: 50, upper: 100, inapps: [
+                    "1",
+                    "3"
+                ])
+            ])
+        ]
+
+        let expectedIds1: Set = [
+            "2",
+            "4"
+        ]
+
+        persistenceStorage.deviceUUID = "4078E211-7C3F-C607-D35C-DC6B591EF355"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsFirstVariant.count, expectedIds1.count, "The number of in-apps does not match the expected one")
+        let inappIdsOne = Set(inappsFirstVariant.map { $0.id })
+        XCTAssertEqual(inappIdsOne, expectedIds1, "The in-app IDs do not match the expected ones")
+
+        let expectedIds2: Set = [
+            "1",
+            "2",
+            "3",
+            "4"
+        ]
+
+        persistenceStorage.deviceUUID = "4D27710A-3F3A-FF6E-7764-375B1E06E05D"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsSecondVariant.count, expectedIds2.count, "The number of in-apps does not match the expected one")
+        let inappIdsTwo = Set(inappsSecondVariant.map { $0.id })
+        XCTAssertEqual(inappIdsTwo, expectedIds2, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_compare_cg_and_concrete_inapps_and_all_inapps() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(variants: [
+                stub.getVariantConcrete(lower: 0, upper: 30, inapps: []),
+                stub.getVariantConcrete(id: "211f1c16-fa72-4456-bf87-af448eb84a32", lower: 30, upper: 65, inapps: ["1", "3"]),
+                stub.getVariantAll(lower: 65, upper: 100)
+            ])
+        ]
+
+        persistenceStorage.deviceUUID = "4078E211-7C3F-C607-D35C-DC6B591EF355"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsFirstVariant.count, 0, "The number of in-apps does not match the expected one")
+        XCTAssertTrue(inappsFirstVariant.isEmpty, "In-apps should be empty")
+
+        persistenceStorage.deviceUUID = "0809B0F8-8F21-18E8-2EF8-EC2D98938A84"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIdsForSecondVariant: Set = [
+            "1",
+            "3"
+        ]
+        XCTAssertEqual(inappsSecondVariant.count, expectedIdsForSecondVariant.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsSecondVariant.map { $0.id }), expectedIdsForSecondVariant, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "4D27710A-3F3A-FF6E-7764-375B1E06E05D"
+        let inappsThirdVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIdsForThirdVariant: Set = [
+            "1",
+            "2",
+            "3"
+        ]
+        XCTAssertEqual(inappsThirdVariant.count, expectedIdsForThirdVariant.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsThirdVariant.map { $0.id }), expectedIdsForThirdVariant, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_compare_2branch_and_concrete_inapps_and_cg() throws {
+        let response = try InappConfig.configWithABTestTwo.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(variants: [
+                stub.getVariantConcrete(lower: 0, upper: 27, inapps: []),
+                stub.getVariantConcrete(id: "2", lower: 27, upper: 65, inapps: [
+                    "1"
+                ]),
+                stub.getVariantConcrete(lower: 65, upper: 100, inapps: [
+                    "3"
+                ])
+            ])
+        ]
+
+        persistenceStorage.deviceUUID = "4078E211-7C3F-C607-D35C-DC6B591EF355"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds1: Set = [
+            "2",
+            "4"
+        ]
+        XCTAssertEqual(inappsFirstVariant.count, expectedIds1.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFirstVariant.map { $0.id }), expectedIds1, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "0809B0F8-8F21-18E8-2EF8-EC2D98938A84"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds2: Set = [
+            "1",
+            "2",
+            "4"
+        ]
+        XCTAssertEqual(inappsSecondVariant.count, expectedIds2.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsSecondVariant.map { $0.id }), expectedIds2, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "4D27710A-3F3A-FF6E-7764-375B1E06E05D"
+        let inappsThirdVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds3: Set = [
+            "2",
+            "3",
+            "4"
+        ]
+        XCTAssertEqual(inappsThirdVariant.count, expectedIds3.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsThirdVariant.map { $0.id }), expectedIds3, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_compare_2branch_and_concrete_inapps() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(variants: [
+                stub.getVariantConcrete(lower: 0, upper: 99, inapps: [
+                    "1",
+                    "3"
+                ]),
+                stub.getVariantConcrete(lower: 99, upper: 100, inapps: [
+                    "2"
+                ])
+            ])
+        ]
+
+        persistenceStorage.deviceUUID = "4078E211-7C3F-C607-D35C-DC6B591EF355"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds1: Set = [
+            "1",
+            "3"
+        ]
+        XCTAssertEqual(inappsFirstVariant.count, expectedIds1.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFirstVariant.map { $0.id }), expectedIds1, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "C9F84B44-01B9-A3C6-E85B-7FF816D3BA68"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds2: Set = [
+            "2"
+        ]
+        XCTAssertEqual(inappsSecondVariant.count, expectedIds2.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsSecondVariant.map { $0.id }), expectedIds2, "The in-app IDs do not match the expected ones")
+    }
+    func test_aab_show_inapps_in_cg_branch() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(variants: [
+                stub.getVariantConcrete(lower: 0, upper: 33, inapps: []),
+                stub.getVariantConcrete(lower: 33, upper: 66, inapps: []),
+                stub.getVariantConcrete(lower: 66, upper: 100, inapps: [
+                    "1",
+                    "3"
+                ])
+            ])
+        ]
+
+        persistenceStorage.deviceUUID = "4862ADF1-1392-9362-42A2-FF5A65629F50"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds1: Set = [
+            "2"
+        ]
+        XCTAssertEqual(inappsFirstVariant.count, expectedIds1.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFirstVariant.map { $0.id }), expectedIds1, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "0809B0F8-8F21-18E8-2EF8-EC2D98938A84"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsSecondVariant.count, expectedIds1.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsSecondVariant.map { $0.id }), expectedIds1, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "4D27710A-3F3A-FF6E-7764-375B1E06E05D"
+        let inappsThirdVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds2: Set = [
+            "1",
+            "2",
+            "3"
+        ]
+        XCTAssertEqual(inappsThirdVariant.count, expectedIds2.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsThirdVariant.map { $0.id }), expectedIds2, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_aab_not_show_inapps_in_cg_branch() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(
+                id: "c0e2682c-3d0f-4291-9308-9e48a16eb3c8",
+                variants: [
+                    stub.getVariantConcrete(id: "1", lower: 0, upper: 33, inapps: []),
+                    stub.getVariantConcrete(id: "2", lower: 33, upper: 66, inapps: []),
+                    stub.getVariantConcrete(id: "3", lower: 66, upper: 100, inapps: [
+                        "1",
+                        "2",
+                        "3"
+                    ])
+                ]
+            )
+        ]
+
+        persistenceStorage.deviceUUID = "4862ADF1-1392-9362-42A2-FF5A65629F50"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsFirstVariant.count, 0, "The number of in-apps does not match the expected one")
+
+        persistenceStorage.deviceUUID = "0809B0F8-8F21-18E8-2EF8-EC2D98938A84"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsSecondVariant.count, 0, "The number of in-apps does not match the expected one")
+
+        persistenceStorage.deviceUUID = "4D27710A-3F3A-FF6E-7764-375B1E06E05D"
+        let inappsThirdVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds3: Set = [
+            "1",
+            "2",
+            "3"
+        ]
+        XCTAssertEqual(inappsThirdVariant.count, expectedIds3.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsThirdVariant.map { $0.id }), expectedIds3, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_ab_limit_value_check() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(
+                variants: [
+                    stub.getVariantConcrete(lower: 0, upper: 33, inapps: []),
+                    stub.getVariantConcrete(lower: 33, upper: 99, inapps: [
+                        "1"
+                    ]),
+                    stub.getVariantConcrete(lower: 99, upper: 100, inapps: [
+                        "3"
+                    ])
+                ]
+            )
+        ]
+
+        persistenceStorage.deviceUUID = "F3AB8877-CB55-CE3D-1AB3-230D2EA8A220"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds1: Set = [
+            "2"
+        ]
+        XCTAssertEqual(inappsFirstVariant.count, expectedIds1.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFirstVariant.map { $0.id }), expectedIds1, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "3A9F107E-9FBE-8D83-EFE9-5F093001CD54"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds2: Set = [
+            "1",
+            "2"
+        ]
+        XCTAssertEqual(inappsSecondVariant.count, expectedIds2.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsSecondVariant.map { $0.id }), expectedIds2, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "59B675D6-9AF1-1805-2BB3-90C3CF11E5E0"
+        let inappsThirdVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds3: Set = [
+            "2",
+            "3"
+        ]
+        XCTAssertEqual(inappsThirdVariant.count, expectedIds3.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsThirdVariant.map { $0.id }), expectedIds3, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_compare_5_ab_tests_in_one_branch() throws {
+        let response = try InappConfig.configWithABTestTwo.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(
+                variants: [
+                    stub.getVariantConcrete(lower: 0, upper: 10, inapps: [
+                        "1"
+                    ]),
+                    stub.getVariantConcrete(lower: 10, upper: 20, inapps: [
+                        "2"
+                    ]),
+                    stub.getVariantConcrete(lower: 20, upper: 30, inapps: [
+                        "3"
+                    ]),
+                    stub.getVariantConcrete(lower: 30, upper: 70, inapps: [
+                        "4"
+                    ]),
+                    stub.getVariantAll(lower: 70, upper: 100)
+                ]
+            )
+        ]
+
+        persistenceStorage.deviceUUID = "7544976E-FEA4-6A48-EB5D-85A6EEB4D306"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds1: Set = [
+            "1"
+        ]
+        XCTAssertEqual(inappsFirstVariant.count, expectedIds1.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFirstVariant.map { $0.id }), expectedIds1, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "618F8CA3-282D-5B18-7186-F2CF361ABD32"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds2: Set = [
+            "2"
+        ]
+        XCTAssertEqual(inappsSecondVariant.count, expectedIds2.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsSecondVariant.map { $0.id }), expectedIds2, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "DC0F2330-785B-5D80-CD34-F2F520AD618F"
+        let inappsThirdVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds3: Set = [
+            "3"
+        ]
+        XCTAssertEqual(inappsThirdVariant.count, expectedIds3.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsThirdVariant.map { $0.id }), expectedIds3, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "0809B0F8-8F21-18E8-2EF8-EC2D98938A84"
+        let inappsFourthVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds4: Set = [
+            "4"
+        ]
+        XCTAssertEqual(inappsFourthVariant.count, expectedIds4.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFourthVariant.map { $0.id }), expectedIds4, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "4D27710A-3F3A-FF6E-7764-375B1E06E05D"
+        let inappsFifthVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds5: Set = [
+            "1",
+            "2",
+            "3",
+            "4"
+        ]
+        XCTAssertEqual(inappsFifthVariant.count, expectedIds5.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFifthVariant.map { $0.id }), expectedIds5, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_2_different_ab_tests_one() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(
+                salt: "c0e2682c-3d0f-4291-9308-9e48a16eb3c8",
+                variants: [
+                    stub.getVariantConcrete(lower: 0, upper: 25, inapps: []),
+                    stub.getVariantAll(lower: 25, upper: 100)
+                ]
+            ),
+            stub.getABTest(
+                id: "1ec6be6b-421f-464b-9ee4-348a5292a5fd",
+                salt: "b142ff09-68c4-41f9-985d-d220edfad4f",
+                variants: [
+                    stub.getVariantConcrete(lower: 0, upper: 75, inapps: []),
+                    stub.getVariantConcrete(lower: 75, upper: 100, inapps: [
+                        "1",
+                        "2"
+                    ])
+                ]
+            )
+        ]
+
+        persistenceStorage.deviceUUID = "9d7f8e6c-3a2b-4d9a-b1c0-1e1e3a4b5c6d"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsFirstVariant.count, 0, "The number of in-apps does not match the expected one")
+
+        persistenceStorage.deviceUUID = "284c10f7-4f4c-4a1b-92e0-2318f2ae13c9"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        XCTAssertEqual(inappsSecondVariant.count, 0, "The number of in-apps does not match the expected one")
+
+        persistenceStorage.deviceUUID = "677a789d-9a98-4f03-9cb2-af2563fc1d07"
+        let inappsThirdVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds2: Set = [
+            "3"
+        ]
+        XCTAssertEqual(inappsThirdVariant.count, expectedIds2.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsThirdVariant.map { $0.id }), expectedIds2, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "d35df6c2-9e20-4f7e-9e20-51894e2c4810"
+        let inappsFourthVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds3: Set = [
+            "1",
+            "2",
+            "3"
+        ]
+        XCTAssertEqual(inappsFourthVariant.count, expectedIds3.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFourthVariant.map { $0.id }), expectedIds3, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_concrete_inapps_and_all() throws {
+        let response = try InappConfig.configWithABTest.getConfig()
+        let filteredInapps = inappFilter.filterValidInAppMessages(response.inapps?.elements ?? [])
+
+        let abTests: [ABTest]? = [
+            stub.getABTest(
+                variants: [
+                    stub.getVariantConcrete(lower: 0, upper: 35, inapps: [
+                        "1",
+                        "3"
+                    ]),
+                    stub.getVariantAll(lower: 35, upper: 100)
+                ]
+            )
+        ]
+
+        persistenceStorage.deviceUUID = "4078E211-7C3F-C607-D35C-DC6B591EF355"
+        let inappsFirstVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds1: Set = [
+            "1",
+            "3"
+        ]
+        XCTAssertEqual(inappsFirstVariant.count, expectedIds1.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsFirstVariant.map { $0.id }), expectedIds1, "The in-app IDs do not match the expected ones")
+
+        persistenceStorage.deviceUUID = "4D27710A-3F3A-FF6E-7764-375B1E06E05D"
+        let inappsSecondVariant = inappFilter.filterInappsByABTests(abTests, responseInapps: filteredInapps)
+        let expectedIds2: Set = [
+            "1",
+            "2",
+            "3"
+        ]
+        XCTAssertEqual(inappsSecondVariant.count, expectedIds2.count, "The number of in-apps does not match the expected one")
+        XCTAssertEqual(Set(inappsSecondVariant.map { $0.id }), expectedIds2, "The in-app IDs do not match the expected ones")
+    }
+
+    func test_abtests_broken_range_should_return_nil() throws {
+        let response = try InappConfig.configWithABBrokenRange.getConfig()
+        XCTAssertNil(response.abtests, "AB tests with a broken range should return nil")
+    }
+
+    func test_abtests_missing_salt_should_return_nil() throws {
+        let response = try InappConfig.configWithABNoSalt.getConfig()
+        XCTAssertNil(response.abtests, "AB tests without a salt should return nil")
+    }
+
+    func test_abtests_unexpected_key_value_should_return_nil() throws {
+        let response = try InappConfig.configWithABUnexpectedValue.getConfig()
+        XCTAssertNil(response.abtests, "AB tests with an unexpected key/value should return nil")
+    }
+
+    func test_abtests_cross_range_should_return_nil() throws {
+        let response = try InappConfig.configWithABCrossRange.getConfig()
+        XCTAssertNil(response.abtests, "AB tests with overlapping ranges should return nil")
+    }
+
+    func test_abtests_missing_upper_key_should_return_nil() throws {
+        let response = try InappConfig.configWithABNoUpper.getConfig()
+        XCTAssertNil(response.abtests, "AB tests without the upper key should return nil")
+    }
+
+    func test_abtests_lower_bigger_than_upper_should_return_nil() throws {
+        let response = try InappConfig.configWithABLowerBiggerThanUpper.getConfig()
+        XCTAssertNil(response.abtests, "AB tests where lower is greater than upper should return nil")
+    }
+
+    func test_abtests_sdk_version_lower_than_required_should_return_nil() throws {
+        let response = try InappConfig.configWithABNormal.getConfig()
+        XCTAssertNil(response.abtests, "AB tests with a minimum SDK version above the current one should return nil")
+    }
+
+    func test_abtests_type_not_inapps_should_return_nil() throws {
+        let response = try InappConfig.configWithABTypeNotInapps.getConfig()
+        XCTAssertNil(response.abtests, "AB tests with a type other than in-apps should return nil")
+    }
+}

@@ -1,0 +1,339 @@
+//
+//  WebViewController.swift
+//  Mindbox
+//
+//  Created by Egor Kitselyuk on 19.03.2025.
+//
+
+import UIKit
+import MindboxLogger
+
+private let initTimeoutSeconds = Constants.WebView.timeoutSeconds
+
+protocol WebVCDelegate: AnyObject {
+    func closeTapWebViewVC()
+    func closeTimeoutWebViewVC()
+    func closeBridgeLostWebViewVC()
+    func closeLoadFailedWebViewVC(reason: String)
+    func closePresentationFailedWebViewVC(reason: String)
+}
+
+final class WebViewController: UIViewController, InappViewControllerProtocol {
+
+    // MARK: InappViewControllerProtocol
+
+    var layers = [UIView]()
+    var elements = [UIView]()
+    let elementFactories: [ContentElementType: ElementFactory] = [
+        .closeButton: CloseButtonElementFactory()
+    ]
+
+    let layersFactories: [ContentBackgroundLayerType: LayerFactory] = [
+        .image: ImageLayerFactory()
+    ]
+
+    // MARK: Private properties
+
+    private let model: ModalFormVariant
+    private let id: String
+    private let imagesDict: [String: UIImage]
+    private let operation: (name: String, body: String)?
+    private let tags: [String: String]?
+    private let extraParams: [String: JSONValue]?
+
+    private let onPresented: () -> Void
+    private let onCloseInApp: () -> Void
+    private let onError: (InAppPresentationError) -> Void
+    private let onTapAction: InAppMessageTapAction
+    private let windowProvider: () -> UIWindow?
+    private var hasClosed = false
+    private var hasOnPresentedBeenCalled = false
+
+    private enum Constants {
+        static let defaultAlphaBackgroundColor: CGFloat = 0.0
+
+        static let revealDuration: TimeInterval = 0.15
+    }
+
+    private var transparentWebView: TransparentView?
+
+    // MARK: Init
+
+    init(
+        model: ModalFormVariant,
+        id: String,
+        imagesDict: [String: UIImage],
+        onPresented: @escaping () -> Void,
+        onTapAction: @escaping InAppMessageTapAction,
+        onCloseInApp: @escaping () -> Void,
+        onError: @escaping (InAppPresentationError) -> Void,
+        windowProvider: @escaping () -> UIWindow? = WebViewController.defaultWindowProvider,
+        operation: (name: String, body: String)?,
+        tags: [String: String]?,
+        extraParams: [String: JSONValue]? = nil
+    ) {
+        self.model = model
+        self.id = id
+        self.imagesDict = imagesDict
+        self.operation = operation
+        self.tags = tags
+        self.extraParams = extraParams
+        self.onPresented = onPresented
+        self.onCloseInApp = onCloseInApp
+        self.onError = onError
+        self.onTapAction = onTapAction
+        self.windowProvider = windowProvider
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        Logger.common(message: "[WebView] Deinit WebViewVC", category: .webViewInAppMessages)
+        transparentWebView?.cleanUp()
+        DI.injectOrFail(InAppWebViewPrewarmServiceProtocol.self).parkWarmWebView()
+    }
+
+    private func setupWebView() {
+        guard let layer = model.content.background.layers.first else {
+            reportErrorAndClose(
+                .webviewPresentationFailed("[WebView] Missing background layer for in-app id \(id).")
+            )
+            return
+        }
+
+        switch layer {
+        case .webview(let webviewLayer):
+            let params = WebViewStartPayloadBuilder.mergedParams(config: webviewLayer.params, fromCaller: extraParams)
+            let webView = TransparentView(frame: .zero, params: params, userAgent: createUserAgent(), operation: operation, inAppId: id, tags: tags)
+            view.addSubview(webView)
+
+            setupConstraints(for: webView, in: view)
+
+            webView.delegate = self
+            webView.webViewAction = self
+            self.transparentWebView = webView
+            webView.loadHTMLPage(
+                baseUrl: webviewLayer.baseUrl,
+                contentUrl: webviewLayer.contentUrl
+            )
+        default:
+            reportErrorAndClose(
+                .webviewPresentationFailed("[WebView] Invalid background layer type for in-app id \(id).")
+            )
+            return
+        }
+    }
+
+    private func setupConstraints(for view: UIView, in parentView: UIView) {
+        view.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            view.topAnchor.constraint(equalTo: parentView.topAnchor),
+            view.leadingAnchor.constraint(equalTo: parentView.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: parentView.trailingAnchor),
+            view.bottomAnchor.constraint(equalTo: parentView.bottomAnchor)
+        ])
+    }
+
+    // MARK: Life cycle
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black.withAlphaComponent(Constants.defaultAlphaBackgroundColor)
+        let onTapDimmedViewGesture = UITapGestureRecognizer(
+            target: self,
+            action: #selector(onTapDimmedView)
+        )
+        view.addGestureRecognizer(onTapDimmedViewGesture)
+        view.isUserInteractionEnabled = true
+        setupWebView()
+        addLifecycleObservers()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
+    }
+
+    override func motionEnded(_ motion: UIEvent.EventSubtype, with event: UIEvent?) {
+        if motion == .motionShake {
+            transparentWebView?.handleSystemShake()
+        }
+        super.motionEnded(motion, with: event)
+    }
+
+    // MARK: Private methods
+
+    @objc
+    private func onTapDimmedView() {
+        onClose()
+    }
+    
+    private func addLifecycleObservers() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+    }
+
+    private func removeLifecycleObservers() {
+        NotificationCenter.default.removeObserver(self, name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: UIApplication.willEnterForegroundNotification, object: nil)
+    }
+
+    @objc
+    private func appDidEnterBackground() {
+        guard !hasOnPresentedBeenCalled, !hasClosed else { return }
+        transparentWebView?.cancelTimeoutTimer()
+        Logger.common(message: "[WebView] App entered background, timeout timer cancelled for in-app id \(id)", category: .webViewInAppMessages)
+    }
+
+    @objc
+    private func appWillEnterForeground() {
+        guard !hasOnPresentedBeenCalled, !hasClosed else { return }
+        transparentWebView?.restartTimeoutTimer()
+        Logger.common(message: "[WebView] App entering foreground, timeout timer restarted for in-app id \(id)", category: .webViewInAppMessages)
+    }
+
+    private func createUserAgent() -> String {
+        SDKUserAgent.build()
+    }
+}
+
+extension WebViewController: WebVCDelegate {
+    func closeTapWebViewVC() {
+        Logger.common(message: "[WebView] WebViewVC closeWebView", category: .webViewInAppMessages)
+        onClose()
+    }
+    
+    func closeTimeoutWebViewVC() {
+        let error = Self.timeoutError(
+            readyCheckFailure: transparentWebView?.readyCheckFailure,
+            httpErrorDetail: transparentWebView?.noCacheRetryTelemetryDetail
+        )
+        Logger.common(message: "[WebView] In-app \(id) closed: \(error.failureDetails ?? "")", category: .webViewInAppMessages)
+        reportErrorAndClose(error)
+    }
+
+    static func timeoutError(readyCheckFailure: String?, httpErrorDetail: String? = nil) -> InAppPresentationError {
+        let suffix = httpErrorDetail.map { " \($0)" } ?? ""
+        guard let readyCheckFailure else {
+            return .webviewLoadFailed("Page did not send init within \(initTimeoutSeconds)s.\(suffix)")
+        }
+        return .webviewPresentationFailed("JS bridge not found on the loaded page within \(initTimeoutSeconds)s: \(readyCheckFailure).\(suffix)")
+    }
+
+    func closeBridgeLostWebViewVC() {
+        let status = transparentWebView?.readyCheckFailure.map { ": \($0)" } ?? ""
+        reportErrorAndClose(.webviewPresentationFailed("JS bridge lost after the page was shown\(status)"))
+    }
+
+    func closeLoadFailedWebViewVC(reason: String) {
+        Logger.common(message: "[WebView] WebViewVC closeLoadFailedWebViewVC. Reason: \(reason)", category: .webViewInAppMessages)
+        reportErrorAndClose(
+            .webviewLoadFailed(reason)
+        )
+    }
+
+    func closePresentationFailedWebViewVC(reason: String) {
+        Logger.common(message: "[WebView] WebViewVC closePresentationFailedWebViewVC. Reason: \(reason)", category: .webViewInAppMessages)
+        reportErrorAndClose(.webviewPresentationFailed(reason))
+    }
+}
+
+extension WebViewController: WebViewAction {
+
+    func onInit() {
+        removeLifecycleObservers()
+        DispatchQueue.main.async {
+            guard !self.hasClosed else { return }
+            if let window = self.windowProvider() {
+                window.isUserInteractionEnabled = true
+                UIView.animate(withDuration: Constants.revealDuration) {
+                    window.alpha = 1.0
+                }
+                window.makeKeyAndVisible()
+                self.notifyPresentedIfNeeded()
+                Logger.common(message: "[WebView] TransparentWebView: Window is now visible", category: .webViewInAppMessages)
+            }
+        }
+    }
+
+    func onCompleted(data: String) {
+        Logger.common(message: "[WebView] WebViewVC completedWebView \(data)", category: .webViewInAppMessages)
+        do {
+            let jsonData = data.data(using: .utf8) ?? Data()
+            let dto = try JSONDecoder().decode(ContentBackgroundLayerActionDTO.self, from: jsonData)
+            let action = try LayerActionFilterService().filter(dto)
+
+            guard let tapData = action.handleTap() else { return }
+            onTapAction(tapData.url, tapData.payload)
+        } catch {
+            Logger.common(message: "[WebView] WebViewVC completedWebView. Error on decoding or filtering action. Error: \(error)", category: .webViewInAppMessages)
+        }
+    }
+
+    func onClose() {
+        close(reporting: nil)
+    }
+
+    func onHide() {
+        DispatchQueue.main.async {
+            guard !self.hasClosed else { return }
+            if let window = self.windowProvider() {
+                window.isUserInteractionEnabled = false
+                window.alpha = 0.00
+                Logger.common(message: "[WebView] TransparentWebView: Window is now non-interactive and transparent", category: .webViewInAppMessages)
+            }
+        }
+    }
+}
+
+private extension WebViewController {
+    static func defaultWindowProvider() -> UIWindow? {
+        UIApplication.shared.windows.first(where: { $0.rootViewController is WebViewController })
+    }
+
+    func notifyPresentedIfNeeded() {
+        guard !hasOnPresentedBeenCalled else {
+            return
+        }
+        hasOnPresentedBeenCalled = true
+        onPresented()
+    }
+
+    func reportErrorAndClose(_ error: InAppPresentationError) {
+        close(reporting: error)
+    }
+
+    func close(reporting error: InAppPresentationError?) {
+        guard !hasClosed else { return }
+        endShow()
+        if let error {
+            onError(error)
+        }
+        Logger.common(message: "[WebView] WebViewVC closeWebView", category: .webViewInAppMessages)
+        onCloseInApp()
+    }
+}
+
+extension WebViewController: InAppShowEnding {
+    func endShow() {
+        guard !hasClosed else { return }
+        hasClosed = true
+        transparentWebView?.endShow()
+    }
+}

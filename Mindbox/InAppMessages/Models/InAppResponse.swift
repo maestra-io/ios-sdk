@@ -1,0 +1,14 @@
+//
+//  InAppResponse.swift
+//  Mindbox
+//
+//  Created by Maksim Kazakov on 06.09.2022.
+//  Copyright © 2022 Mikhail Barilov. All rights reserved.
+//
+
+import Foundation
+
+struct InAppResponse {
+    let triggerEvent: InAppMessageTriggerEvent
+    let inAppToShowId: String
+}

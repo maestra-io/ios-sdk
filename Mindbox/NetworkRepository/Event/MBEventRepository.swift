@@ -1,0 +1,139 @@
+//
+//  MBEventRepository.swift
+//  Mindbox
+//
+//  Created by Maksim Kazachkov on 03.02.2021.
+//  Copyright © 2021 Mindbox. All rights reserved.
+//
+
+import Foundation
+import MindboxLogger
+
+class MBEventRepository: EventRepository {
+    private let fetcher: NetworkFetcher
+
+    private let persistenceStorage: PersistenceStorage
+
+    init(fetcher: NetworkFetcher, persistenceStorage: PersistenceStorage) {
+        self.fetcher = fetcher
+        self.persistenceStorage = persistenceStorage
+    }
+
+    func send(event: Event, completion: @escaping (Result<Void, MindboxError>) -> Void) {
+        guard let configuration = persistenceStorage.configuration else {
+            let error = MindboxError(.init(
+                errorKey: .invalidConfiguration,
+                reason: "Configuration is not set"
+            ))
+            completion(.failure(error))
+            return
+        }
+        guard let deviceUUID = persistenceStorage.deviceUUID else {
+            let error = MindboxError(.init(
+                errorKey: .invalidConfiguration,
+                reason: "DeviceUUID is not set"
+            ))
+            completion(.failure(error))
+            return
+        }
+        let wrapper = EventWrapper(
+            event: event,
+            endpoint: configuration.endpoint,
+            deviceUUID: deviceUUID
+        )
+        let route = makeRoute(wrapper: wrapper)
+        fetcher.request(route: route, completion: completion)
+    }
+
+    func send<T>(type: T.Type, event: Event, completion: @escaping (Result<T, MindboxError>) -> Void) where T: Decodable {
+        let deliver: (Result<T, MindboxError>) -> Void = { result in
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+        guard let configuration = persistenceStorage.configuration else {
+            let error = MindboxError(.init(
+                errorKey: .invalidConfiguration,
+                reason: "Configuration is not set"
+            ))
+            deliver(.failure(error))
+            return
+        }
+        guard let deviceUUID = persistenceStorage.deviceUUID else {
+            let error = MindboxError(.init(
+                errorKey: .invalidConfiguration,
+                reason: "DeviceUUID is not set"
+            ))
+            deliver(.failure(error))
+            return
+        }
+        let wrapper = EventWrapper(
+            event: event,
+            endpoint: configuration.endpoint,
+            deviceUUID: deviceUUID
+        )
+        let route = makeRoute(wrapper: wrapper)
+        fetcher.request(type: type, route: route, completion: deliver)
+    }
+
+    func sendRaw(event: Event, completion: @escaping (Result<Data, MindboxError>) -> Void) {
+        guard let configuration = persistenceStorage.configuration else {
+            let error = MindboxError(.init(
+                errorKey: .invalidConfiguration,
+                reason: "Configuration is not set"
+            ))
+            completion(.failure(error))
+            return
+        }
+        guard let deviceUUID = persistenceStorage.deviceUUID else {
+            let error = MindboxError(.init(
+                errorKey: .invalidConfiguration,
+                reason: "DeviceUUID is not set"
+            ))
+            completion(.failure(error))
+            return
+        }
+        let wrapper = EventWrapper(
+            event: event,
+            endpoint: configuration.endpoint,
+            deviceUUID: deviceUUID
+        )
+        let route = makeRoute(wrapper: wrapper)
+        fetcher.requestRaw(route: route) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case let .failure(error):
+                    completion(.failure(error))
+                case let .success(data):
+                    completion(.success(data))
+                }
+            }
+        }
+    }
+
+    private func makeRoute(wrapper: EventWrapper) -> Route {
+        switch wrapper.event.type {
+        case .installed,
+             .infoUpdated,
+             .keepAlive,
+             .trackClick,
+             .installedWithoutCustomer,
+             .inAppViewEvent,
+             .inAppClickEvent,
+             .inAppTargetingEvent,
+             .inAppShowFailureEvent,
+             .sdkLogs:
+            return EventRoute.asyncEvent(wrapper)
+        case .customEvent:
+            return EventRoute.customAsyncEvent(wrapper)
+        case .trackVisit:
+            return EventRoute.trackVisit(wrapper)
+        case .syncEvent:
+            return EventRoute.syncEvent(wrapper)
+        }
+    }
+    
+    func cancelAllRequests() {
+        fetcher.cancelAllTasks()
+    }
+}
